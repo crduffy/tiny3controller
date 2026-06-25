@@ -284,99 +284,243 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>OBSBOT Tiny 3 Control</title>
+<title>OBSBOT Tiny 3 · Control Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Sora:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#0f1115;--card:#191c23;--line:#2a2f3a;--fg:#e7ebf2;--mut:#8b93a3;--acc:#4f9cff;}
+  :root{
+    --bg:#080a0e; --bg2:#0b0e13;
+    --fg:#eaf0f6; --mut:#7e8a9c; --mut2:#5d6878;
+    --acc:#2fe0c0; --acc-deep:#13b89c; --acc-soft:rgba(47,224,192,.14);
+    --live:#ff5b6e;
+    --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.12);
+    --surface:linear-gradient(168deg,#161b23 0%,#10141b 60%,#0d1118 100%);
+    --shadow:0 18px 40px -22px rgba(0,0,0,.85);
+    --mono:"Chakra Petch",ui-monospace,monospace;
+    --disp:"Chakra Petch",system-ui,sans-serif;
+    --body:"Sora",system-ui,-apple-system,sans-serif;
+  }
   *{box-sizing:border-box}
-  body{margin:0;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);
-       -webkit-user-select:none;user-select:none}
-  header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;
-         justify-content:space-between;align-items:center}
-  header b{font-size:16px} header span{color:var(--mut);font-size:12px}
-  main{max-width:760px;margin:0 auto;padding:16px;display:grid;gap:16px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
-  .card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
-  .pad{display:grid;grid-template-columns:repeat(3,72px);grid-template-rows:repeat(3,72px);
-       gap:8px;justify-content:center;margin:6px 0 14px}
-  .pad button{font-size:26px;border-radius:12px}
-  button{background:#222733;color:var(--fg);border:1px solid var(--line);border-radius:10px;
-         padding:12px;font-size:15px;cursor:pointer;touch-action:manipulation}
-  button:active{background:var(--acc);border-color:var(--acc)}
-  .row{display:flex;align-items:center;gap:12px;margin:10px 0}
-  .row label{width:130px;color:var(--mut);font-size:13px}
-  .row input[type=range]{flex:1}
-  .row .val{width:58px;text-align:right;font-variant-numeric:tabular-nums;color:var(--fg)}
-  .toggle{display:flex;align-items:center;gap:8px}
-  .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-  .presets .slot{display:grid;gap:6px}
-  .presets .slot small{text-align:center;color:var(--mut)}
-  .presets .save{font-size:12px;padding:6px;background:#1c2330}
-  .zoomrow{display:flex;gap:8px;align-items:center}
-  .zoomrow button{width:54px;font-size:20px}
-  .status{display:flex;align-items:center;gap:7px}
-  .dot{width:9px;height:9px;border-radius:50%;background:#c2483a;box-shadow:0 0 6px #c2483a}
-  .dot.ok{background:#3ec46d;box-shadow:0 0 6px #3ec46d}
-  .preview-wrap{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;font-family:var(--body);font-size:15px;line-height:1.45;color:var(--fg);
+    background:var(--bg);-webkit-user-select:none;user-select:none;min-height:100vh;
+    background-image:
+      radial-gradient(900px 500px at 12% -8%, rgba(47,224,192,.10), transparent 60%),
+      radial-gradient(700px 600px at 110% 0%, rgba(70,120,255,.07), transparent 55%),
+      linear-gradient(180deg,#090b10,#070809);
+    background-attachment:fixed;}
+  /* faint instrument grid overlay */
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.5;z-index:0;
+    background-image:
+      linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);
+    background-size:44px 44px;mask-image:radial-gradient(circle at 50% 30%,#000 30%,transparent 85%);}
+
+  /* ---------- header ---------- */
+  header{position:sticky;top:0;z-index:20;display:flex;justify-content:space-between;align-items:center;
+    gap:16px;padding:14px clamp(16px,3vw,30px);
+    background:rgba(9,11,16,.72);backdrop-filter:blur(14px);
+    border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:12px;min-width:0}
+  .logo{width:30px;height:30px;border-radius:9px;flex:none;position:relative;
+    background:radial-gradient(circle at 50% 40%,var(--acc),var(--acc-deep) 70%);
+    box-shadow:0 0 0 1px rgba(47,224,192,.4),0 0 20px -4px var(--acc)}
+  .logo::after{content:"";position:absolute;inset:8px;border-radius:50%;background:#070809;
+    box-shadow:inset 0 0 0 2px rgba(47,224,192,.7)}
+  .brand b{font-family:var(--disp);font-weight:700;font-size:15px;letter-spacing:.14em;text-transform:uppercase}
+  .brand small{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.32em;
+    color:var(--acc);text-transform:uppercase;margin-top:1px}
+  .status{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;
+    letter-spacing:.1em;text-transform:uppercase;color:var(--mut);
+    padding:7px 13px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.02)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--live);box-shadow:0 0 0 0 rgba(255,91,110,.6)}
+  .dot.ok{background:var(--acc);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(47,224,192,.5)}70%{box-shadow:0 0 0 7px rgba(47,224,192,0)}100%{box-shadow:0 0 0 0 rgba(47,224,192,0)}}
+
+  /* ---------- layout ---------- */
+  .deck{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:clamp(16px,2.4vw,28px);
+    display:grid;gap:clamp(14px,1.8vw,20px);grid-template-columns:1fr}
+  .col-right{display:grid;gap:clamp(14px,1.8vw,20px);align-content:start}
+  @media(min-width:1024px){
+    .deck{grid-template-columns:minmax(460px,1.12fr) minmax(380px,1fr);align-items:start}
+    .col-left{position:sticky;top:80px}
+  }
+
+  /* ---------- cards ---------- */
+  .card{position:relative;background:var(--surface);border:1px solid var(--line);
+    border-radius:18px;padding:clamp(15px,2vw,20px);box-shadow:var(--shadow);
+    opacity:0;transform:translateY(10px);animation:rise .5s cubic-bezier(.2,.7,.3,1) forwards}
+  .card::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+    background:linear-gradient(180deg,rgba(255,255,255,.05),transparent 28%)}
+  .col-left .card{animation-delay:.02s}
+  .col-right .card:nth-child(1){animation-delay:.08s}
+  .col-right .card:nth-child(2){animation-delay:.14s}
+  .col-right .card:nth-child(3){animation-delay:.2s}
+  @keyframes rise{to{opacity:1;transform:none}}
+  @media(prefers-reduced-motion:reduce){.card{animation:none;opacity:1;transform:none}}
+  .card h2{margin:0 0 15px;font-family:var(--mono);font-size:11px;font-weight:600;
+    letter-spacing:.22em;text-transform:uppercase;color:var(--mut);display:flex;align-items:center;gap:9px}
+  .card h2::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--acc);
+    box-shadow:0 0 8px var(--acc)}
+
+  /* ---------- preview ---------- */
+  .preview-wrap{position:relative;background:#000;border-radius:13px;overflow:hidden;aspect-ratio:16/9;
+    border:1px solid var(--line2);box-shadow:inset 0 0 0 1px rgba(0,0,0,.5),inset 0 0 60px rgba(0,0,0,.6)}
   .preview-wrap video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+  /* corner viewfinder ticks */
+  .preview-wrap::after{content:"";position:absolute;inset:11px;border-radius:7px;pointer-events:none;
+    background:
+      linear-gradient(var(--acc),var(--acc)) 0 0/14px 2px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 0 0/2px 14px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 100% 0/14px 2px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 100% 0/2px 14px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 0 100%/14px 2px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 0 100%/2px 14px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 100% 100%/14px 2px no-repeat,
+      linear-gradient(var(--acc),var(--acc)) 100% 100%/2px 14px no-repeat;
+    opacity:.55}
   .preview-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-       text-align:center;padding:18px;color:var(--mut);font-size:13px}
-  .pvbar{display:flex;gap:8px;align-items:center;margin-top:10px}
-  .pvbar select{flex:1;background:#222733;color:var(--fg);border:1px solid var(--line);
-       border-radius:8px;padding:8px}
-  .pvbar button{padding:8px 12px}
+    text-align:center;padding:24px;color:var(--mut);font-size:13px;white-space:pre-line;
+    background:radial-gradient(circle at 50% 50%,rgba(10,12,16,.4),rgba(8,10,14,.85))}
+  .live{position:absolute;top:12px;left:12px;display:none;align-items:center;gap:7px;
+    font-family:var(--mono);font-size:10px;letter-spacing:.2em;font-weight:600;
+    padding:5px 10px;border-radius:6px;background:rgba(0,0,0,.5);backdrop-filter:blur(6px);
+    border:1px solid rgba(255,91,110,.5);color:#ffd7dc}
+  .live::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--live);
+    box-shadow:0 0 8px var(--live);animation:pulse 1.6s infinite}
+  .live.on{display:flex}
+  .pvbar{display:flex;gap:9px;align-items:center;margin-top:13px}
+  select,.btn{font-family:var(--body);color:var(--fg);background:rgba(255,255,255,.04);
+    border:1px solid var(--line2);border-radius:10px;padding:10px 12px;font-size:13px;cursor:pointer}
+  select{flex:1;min-width:0;text-overflow:ellipsis;
+    background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);
+    background-position:calc(100% - 16px) center,calc(100% - 11px) center;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat;-webkit-appearance:none;appearance:none;padding-right:30px}
+  select:focus,.btn:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}
+
+  /* ---------- generic buttons ---------- */
+  button{font-family:var(--body);background:rgba(255,255,255,.045);color:var(--fg);
+    border:1px solid var(--line2);border-radius:12px;padding:12px;font-size:14px;cursor:pointer;
+    touch-action:manipulation;transition:transform .08s,background .15s,border-color .15s,box-shadow .15s}
+  button:hover{border-color:rgba(47,224,192,.4);background:rgba(47,224,192,.06)}
+  button:active{transform:scale(.95)}
+  .pvtoggle{font-family:var(--mono);letter-spacing:.12em;text-transform:uppercase;font-size:12px;
+    padding:10px 16px;color:var(--acc);border-color:rgba(47,224,192,.35);background:var(--acc-soft)}
+
+  /* ---------- PTZ pad ---------- */
+  .padwrap{display:flex;justify-content:center;margin:4px 0 18px}
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);
+    gap:9px;width:min(232px,72vw);aspect-ratio:1;padding:16px;border-radius:50%;
+    background:radial-gradient(circle at 50% 38%,rgba(47,224,192,.07),rgba(255,255,255,.015) 55%,transparent 72%);
+    border:1px solid var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.05),var(--shadow)}
+  .pad span{pointer-events:none}
+  .pad button{display:flex;align-items:center;justify-content:center;font-size:20px;border-radius:14px;
+    color:var(--acc);background:rgba(255,255,255,.04)}
+  .pad button[data-dir]{border-radius:16px}
+  .pad button[data-dir]:active{background:var(--acc);color:#04130f;border-color:var(--acc);
+    box-shadow:0 0 22px -4px var(--acc)}
+  #center{border-radius:50%;font-size:18px;color:var(--mut);font-family:var(--mono)}
+  #center:hover{color:var(--acc)}
+
+  /* ---------- zoom + control rows ---------- */
+  .zoomrow{display:grid;grid-template-columns:auto 42px 1fr 44px 42px;gap:11px;align-items:center}
+  .zoomrow .zlab{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut)}
+  .zoomrow button{padding:8px 0;font-size:18px;border-radius:10px}
+  .row{display:grid;grid-template-columns:118px 1fr 50px;align-items:center;gap:14px;margin:13px 0}
+  .row:first-child{margin-top:4px}
+  .row label{font-size:13px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .row .val{font-family:var(--mono);font-size:13px;text-align:right;color:var(--acc);font-variant-numeric:tabular-nums}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:5px;border-radius:99px;
+    background:linear-gradient(90deg,var(--acc-deep),var(--acc)) no-repeat,rgba(255,255,255,.1);
+    background-size:var(--fill,50%) 100%;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;border-radius:50%;
+    background:#eafff9;border:3px solid var(--acc-deep);box-shadow:0 2px 6px rgba(0,0,0,.5);margin-top:0}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#eafff9;border:3px solid var(--acc-deep)}
+  input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+  /* toggle rows: switch on the right */
+  .toggle-row{grid-template-columns:1fr auto}
+  .toggle-row label{color:var(--fg)}
+  .toggle input[type=checkbox]{-webkit-appearance:none;appearance:none;width:44px;height:25px;border-radius:99px;
+    background:rgba(255,255,255,.12);border:1px solid var(--line2);position:relative;cursor:pointer;transition:background .2s}
+  .toggle input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:19px;height:19px;
+    border-radius:50%;background:#cdd6e2;transition:transform .2s,background .2s}
+  .toggle input[type=checkbox]:checked{background:var(--acc-deep);border-color:var(--acc)}
+  .toggle input[type=checkbox]:checked::after{transform:translateX(19px);background:#04130f}
+
+  /* ---------- presets ---------- */
+  .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
+  .presets .slot{display:grid;gap:7px;text-align:center}
+  .presets .go{font-family:var(--mono);font-size:15px;letter-spacing:.06em;padding:15px 0;font-weight:600}
+  .presets .go.filled{color:var(--acc);border-color:rgba(47,224,192,.4);background:var(--acc-soft)}
+  .presets .save{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+    padding:7px 0;color:var(--mut)}
+  .presets small{font-family:var(--mono);font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut2)}
+  @media(max-width:380px){.presets{grid-template-columns:repeat(2,1fr)}}
 </style></head>
 <body>
-<header><b>OBSBOT&nbsp;Tiny&nbsp;3</b>
+<header>
+  <div class="brand">
+    <div class="logo"></div>
+    <div><b>OBSBOT&nbsp;Tiny&nbsp;3</b><small>Control Deck</small></div>
+  </div>
   <span class="status"><span class="dot" id="dot"></span><span id="dev">connecting…</span></span>
 </header>
-<main>
-  <div class="card">
-    <h2>Live preview</h2>
-    <div class="preview-wrap">
-      <video id="preview" autoplay playsinline muted></video>
-      <div class="preview-msg" id="pvmsg">Starting preview…</div>
+<main class="deck">
+  <section class="col-left">
+    <div class="card">
+      <h2>Live Preview</h2>
+      <div class="preview-wrap">
+        <video id="preview" autoplay playsinline muted></video>
+        <div class="live" id="live">LIVE</div>
+        <div class="preview-msg" id="pvmsg">Starting preview…</div>
+      </div>
+      <div class="pvbar">
+        <select id="camsel"></select>
+        <button id="pvtoggle" class="pvtoggle">Stop</button>
+      </div>
     </div>
-    <div class="pvbar">
-      <select id="camsel"></select>
-      <button id="pvtoggle">Stop</button>
+  </section>
+
+  <section class="col-right">
+    <div class="card" id="ptzcard">
+      <h2>Pan · Tilt · Zoom</h2>
+      <div class="padwrap">
+        <div class="pad">
+          <span></span>
+          <button data-dir="up">▲</button>
+          <span></span>
+          <button data-dir="left">◄</button>
+          <button id="center">⌂</button>
+          <button data-dir="right">►</button>
+          <span></span>
+          <button data-dir="down">▼</button>
+          <span></span>
+        </div>
+      </div>
+      <div class="zoomrow">
+        <span class="zlab">Zoom</span>
+        <button data-zoom="-1">−</button>
+        <input type="range" id="zoom"><span class="val" id="zoom_v">–</span>
+        <button data-zoom="1">+</button>
+      </div>
     </div>
-  </div>
 
-  <div class="card" id="ptzcard">
-    <h2>Pan / Tilt / Zoom</h2>
-    <div class="pad">
-      <span></span>
-      <button data-dir="up">▲</button>
-      <span></span>
-      <button data-dir="left">◄</button>
-      <button id="center">＋</button>
-      <button data-dir="right">►</button>
-      <span></span>
-      <button data-dir="down">▼</button>
-      <span></span>
+    <div class="card">
+      <h2>Focus &amp; Exposure</h2>
+      <div id="focusexp"></div>
     </div>
-    <div class="zoomrow">
-      <label style="width:130px;color:var(--mut);font-size:13px">Zoom</label>
-      <button data-zoom="-1">−</button>
-      <input type="range" id="zoom"><span class="val" id="zoom_v">–</span>
-      <button data-zoom="1">+</button>
+
+    <div class="card">
+      <h2>Color &amp; Image</h2>
+      <div id="image"></div>
     </div>
-  </div>
 
-  <div class="card">
-    <h2>Focus &amp; Exposure</h2>
-    <div id="focusexp"></div>
-  </div>
-
-  <div class="card">
-    <h2>Color &amp; Image</h2>
-    <div id="image"></div>
-  </div>
-
-  <div class="card">
-    <h2>Presets</h2>
-    <div class="presets" id="presets"></div>
-  </div>
+    <div class="card">
+      <h2>Presets</h2>
+      <div class="presets" id="presets"></div>
+    </div>
+  </section>
 </main>
 <script>
 const $=s=>document.querySelector(s), api=(p,b)=>fetch(p,{method:b?'POST':'GET',
@@ -385,8 +529,9 @@ let ST={}, PRE={};
 
 /* ---- live preview via the browser's own camera access (getUserMedia) ---- */
 let stream=null;
-const vid=$('#preview'), pvmsg=$('#pvmsg'), camsel=$('#camsel'), pvtoggle=$('#pvtoggle');
-function pvShow(msg){ pvmsg.textContent=msg||''; pvmsg.style.display=msg?'flex':'none'; }
+const vid=$('#preview'), pvmsg=$('#pvmsg'), camsel=$('#camsel'), pvtoggle=$('#pvtoggle'), live=$('#live');
+function pvShow(msg){ pvmsg.textContent=msg||''; pvmsg.style.display=msg?'flex':'none';
+  if(msg) live.classList.remove('on'); }
 
 async function listCams(selectId){
   if(!navigator.mediaDevices?.enumerateDevices) return;
@@ -411,7 +556,7 @@ async function startPreview(deviceId){
     if(stream) stream.getTracks().forEach(t=>t.stop());
     stream=await navigator.mediaDevices.getUserMedia({
       video: deviceId?{deviceId:{exact:deviceId}}:{ width:{ideal:1280} }, audio:false });
-    vid.srcObject=stream; pvShow(''); pvtoggle.textContent='Stop';
+    vid.srcObject=stream; pvShow(''); pvtoggle.textContent='Stop'; live.classList.add('on');
     await listCams(stream.getVideoTracks()[0]?.getSettings().deviceId);
   }catch(e){
     pvShow('Camera busy or blocked: '+e.name+
@@ -442,20 +587,24 @@ $('#center').onclick=()=>api('/api/center',{}).then(refresh);
 
 function setKey(key,value){ return api('/api/set',{key,value}); }
 
+function fill(inp){ const r=(inp.max-inp.min)||1;
+  inp.style.setProperty('--fill',(100*(inp.value-inp.min)/r)+'%'); }
+
 function sliderRow(c){
-  const wrap=document.createElement('div'); wrap.className='row';
+  const wrap=document.createElement('div'); wrap.className='row slider-row';
   const lab=document.createElement('label'); lab.textContent=c.label;
   const inp=document.createElement('input'); inp.type='range';
   inp.min=c.min; inp.max=c.max; inp.step=c.step||1; inp.value=c.value??c.default;
   inp.disabled=!!c.inactive;
   const val=document.createElement('span'); val.className='val'; val.textContent=inp.value;
-  inp.oninput=()=>{val.textContent=inp.value;};
+  fill(inp);
+  inp.oninput=()=>{val.textContent=inp.value; fill(inp);};
   inp.onchange=()=>setKey(c.key,+inp.value);
-  if(c.inactive) wrap.style.opacity=.45;
+  if(c.inactive) wrap.style.opacity=.4;
   wrap.append(lab,inp,val); return wrap;
 }
 function toggleRow(c){
-  const wrap=document.createElement('div'); wrap.className='row';
+  const wrap=document.createElement('div'); wrap.className='row toggle-row';
   const lab=document.createElement('label'); lab.textContent=c.label;
   const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!!c.value;
   cb.onchange=()=>setKey(c.key,cb.checked?1:0).then(refresh);
@@ -473,17 +622,18 @@ function renderGroup(target,keys){
 document.querySelectorAll('[data-zoom]').forEach(b=>{
   b.onclick=()=>{ const c=ST.zoom; if(!c)return;
     let v=Math.max(c.min,Math.min(c.max,(+$('#zoom').value)+ (+b.dataset.zoom)*(c.step*4||4)));
-    $('#zoom').value=v; $('#zoom_v').textContent=v; setKey('zoom',v); };
+    $('#zoom').value=v; $('#zoom_v').textContent=v; fill($('#zoom')); setKey('zoom',v); };
 });
 $('#zoom').onchange=()=>{ $('#zoom_v').textContent=$('#zoom').value; setKey('zoom',+$('#zoom').value); };
-$('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value; };
+$('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value; fill($('#zoom')); };
 
 function renderPresets(){
   const el=$('#presets'); el.innerHTML='';
   for(let i=1;i<=4;i++){
     const slot=document.createElement('div'); slot.className='slot';
+    const filled=PRE[String(i)];
     const go=document.createElement('button'); go.textContent='P'+i;
-    const filled=PRE[String(i)]; go.style.opacity=filled?1:.45;
+    go.className='go'+(filled?' filled':'');
     go.onclick=()=>api('/api/preset/go',{slot:i}).then(refresh);
     const save=document.createElement('button'); save.className='save'; save.textContent='save';
     save.onclick=()=>api('/api/preset/save',{slot:i}).then(()=>refresh());
@@ -497,7 +647,7 @@ function refresh(){
     ST=s.controls; PRE=s.presets||{};
     $('#dev').textContent=s.device; $('#dot').classList.add('ok');
     if(ST.zoom){ const z=ST.zoom; const zi=$('#zoom');
-      zi.min=z.min; zi.max=z.max; zi.step=z.step||1; zi.value=z.value; $('#zoom_v').textContent=z.value; }
+      zi.min=z.min; zi.max=z.max; zi.step=z.step||1; zi.value=z.value; $('#zoom_v').textContent=z.value; fill(zi); }
     renderGroup('#focusexp',['focus_auto','focus','auto_exposure','exposure']);
     renderGroup('#image',['wb_auto','wb_temp','brightness','contrast','saturation','hue','gain','sharpness','backlight']);
     renderPresets();
