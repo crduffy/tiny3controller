@@ -436,11 +436,29 @@ refresh();
 """
 
 
+def bind_server(host, port):
+    """Bind on the requested port; if busy, try the next few, then any free port.
+
+    --port 0 (or an unavailable port) lets the OS pick an open one.
+    Returns the started ThreadingHTTPServer (actual port in .server_address).
+    """
+    candidates = [port] if port == 0 else list(range(port, port + 20)) + [0]
+    last_err = None
+    for p in candidates:
+        try:
+            return ThreadingHTTPServer((host, p), Handler)
+        except OSError as e:
+            last_err = e
+            continue
+    raise SystemExit(f"Could not bind any port on {host}: {last_err}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Local web controller for the OBSBOT Tiny 3")
     ap.add_argument("--device", help="V4L2 node (default: auto-detect OBSBOT)")
     ap.add_argument("--host", default="127.0.0.1", help="bind host (use 0.0.0.0 for phone access)")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8080,
+                    help="preferred port; if busy the next free one is used (0 = auto)")
     args = ap.parse_args()
 
     device = args.device or find_obsbot()
@@ -448,10 +466,13 @@ def main():
         raise SystemExit("No OBSBOT camera found. Pass --device /dev/videoN explicitly.")
 
     Handler.cam = Camera(device)
+    srv = bind_server(args.host, args.port)
+    actual_port = srv.server_address[1]
+    if actual_port != args.port and args.port != 0:
+        print(f"Port {args.port} was busy — using {actual_port} instead.")
     print(f"OBSBOT control on {device}")
-    print(f"  -> http://{args.host}:{args.port}"
+    print(f"  -> http://{args.host}:{actual_port}"
           + ("   (also reachable from your LAN/phone)" if args.host == "0.0.0.0" else ""))
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

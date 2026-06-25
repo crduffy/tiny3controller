@@ -21,9 +21,11 @@ pan/tilt/zoom/focus to `tiny3_presets.json`).
 python3 tiny3_web.py                       # auto-detect OBSBOT, serve on 127.0.0.1:8080
 python3 tiny3_web.py --host 0.0.0.0        # also reachable from your phone/LAN
 python3 tiny3_web.py --device /dev/video4 --port 8099
+python3 tiny3_web.py --port 0              # let the OS pick any open port
 ```
 
-Then open <http://localhost:8080>.
+If the chosen port is busy, the next free port is used automatically (and
+printed at startup). The actual URL is always shown in the console.
 
 ## Permissions
 
