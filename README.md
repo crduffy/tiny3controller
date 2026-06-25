@@ -9,7 +9,19 @@ This covers the controls the camera exposes natively:
 pan / tilt / zoom, focus (auto + manual), exposure (auto + manual),
 white balance, and image tuning (brightness, contrast, saturation, hue, gain,
 sharpness, backlight). **Presets** are implemented in software (save & restore
-pan/tilt/zoom/focus to `tiny3_presets.json`).
+pan/tilt/zoom/focus to `tiny3_presets.json`). A **live preview** is shown at the
+top of the page.
+
+### Live preview
+
+The preview uses the browser's own camera access (`getUserMedia`), so the video
+is hardware-decoded and never passes through the daemon. Because browsers only
+allow camera access from a *secure context*, the preview works when you open the
+page on **`http://localhost` / `http://127.0.0.1`** (the local machine) or over
+HTTPS. Opening it from a **phone over plain `http://<ip>`** will show the
+controls but not the preview (the browser blocks camera access on insecure
+origins). The preview also needs the camera to be free — if another app (Zoom,
+OBS, …) is currently using it, the preview will report the camera as busy.
 
 > AI tracking, gestures, FOV and the other OBSBOT-specific features live on the
 > camera's vendor UVC Extension Unit and are *not* covered here — that needs the

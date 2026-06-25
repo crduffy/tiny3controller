@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import struct
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,8 @@ class Camera:
     def __init__(self, device):
         self.device = device
         self.fd = os.open(device, os.O_RDWR)
+        # The fd is shared across request-handler threads; serialize all ioctls.
+        self._lock = threading.Lock()
 
     def close(self):
         try:
@@ -82,7 +85,8 @@ class Camera:
         """Return dict(min,max,step,default,type,name,flags) or None if absent."""
         buf = bytearray(struct.pack(_QUERY_FMT, cid, 0, b"", 0, 0, 0, 0, 0))
         try:
-            fcntl.ioctl(self.fd, VIDIOC_QUERYCTRL, buf, True)
+            with self._lock:
+                fcntl.ioctl(self.fd, VIDIOC_QUERYCTRL, buf, True)
         except OSError:
             return None
         _id, ctype, name, mn, mx, step, dflt, flags = struct.unpack(_QUERY_FMT, bytes(buf))
@@ -99,7 +103,8 @@ class Camera:
     def get(self, cid):
         buf = bytearray(struct.pack(_CTRL_FMT, cid, 0))
         try:
-            fcntl.ioctl(self.fd, VIDIOC_G_CTRL, buf, True)
+            with self._lock:
+                fcntl.ioctl(self.fd, VIDIOC_G_CTRL, buf, True)
         except OSError:
             return None
         _id, val = struct.unpack(_CTRL_FMT, bytes(buf))
@@ -107,7 +112,8 @@ class Camera:
 
     def set(self, cid, value):
         buf = bytearray(struct.pack(_CTRL_FMT, cid, int(value)))
-        fcntl.ioctl(self.fd, VIDIOC_S_CTRL, buf, True)
+        with self._lock:
+            fcntl.ioctl(self.fd, VIDIOC_S_CTRL, buf, True)
         return self.get(cid)
 
     def snapshot(self):
@@ -307,10 +313,35 @@ INDEX_HTML = r"""<!doctype html>
   .presets .save{font-size:12px;padding:6px;background:#1c2330}
   .zoomrow{display:flex;gap:8px;align-items:center}
   .zoomrow button{width:54px;font-size:20px}
+  .status{display:flex;align-items:center;gap:7px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#c2483a;box-shadow:0 0 6px #c2483a}
+  .dot.ok{background:#3ec46d;box-shadow:0 0 6px #3ec46d}
+  .preview-wrap{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9}
+  .preview-wrap video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+  .preview-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+       text-align:center;padding:18px;color:var(--mut);font-size:13px}
+  .pvbar{display:flex;gap:8px;align-items:center;margin-top:10px}
+  .pvbar select{flex:1;background:#222733;color:var(--fg);border:1px solid var(--line);
+       border-radius:8px;padding:8px}
+  .pvbar button{padding:8px 12px}
 </style></head>
 <body>
-<header><b>OBSBOT&nbsp;Tiny&nbsp;3</b><span id="dev">connecting…</span></header>
+<header><b>OBSBOT&nbsp;Tiny&nbsp;3</b>
+  <span class="status"><span class="dot" id="dot"></span><span id="dev">connecting…</span></span>
+</header>
 <main>
+  <div class="card">
+    <h2>Live preview</h2>
+    <div class="preview-wrap">
+      <video id="preview" autoplay playsinline muted></video>
+      <div class="preview-msg" id="pvmsg">Starting preview…</div>
+    </div>
+    <div class="pvbar">
+      <select id="camsel"></select>
+      <button id="pvtoggle">Stop</button>
+    </div>
+  </div>
+
   <div class="card" id="ptzcard">
     <h2>Pan / Tilt / Zoom</h2>
     <div class="pad">
@@ -351,6 +382,47 @@ INDEX_HTML = r"""<!doctype html>
 const $=s=>document.querySelector(s), api=(p,b)=>fetch(p,{method:b?'POST':'GET',
   headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined}).then(r=>r.json());
 let ST={}, PRE={};
+
+/* ---- live preview via the browser's own camera access (getUserMedia) ---- */
+let stream=null;
+const vid=$('#preview'), pvmsg=$('#pvmsg'), camsel=$('#camsel'), pvtoggle=$('#pvtoggle');
+function pvShow(msg){ pvmsg.textContent=msg||''; pvmsg.style.display=msg?'flex':'none'; }
+
+async function listCams(selectId){
+  if(!navigator.mediaDevices?.enumerateDevices) return;
+  const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+  camsel.innerHTML='';
+  devs.forEach((d,i)=>{ const o=document.createElement('option');
+    o.value=d.deviceId; o.textContent=d.label||('Camera '+(i+1)); camsel.append(o); });
+  // prefer the OBSBOT if we can see labels
+  const ob=devs.find(d=>/obsbot/i.test(d.label));
+  if(selectId) camsel.value=selectId;
+  else if(ob) camsel.value=ob.deviceId;
+}
+
+async function startPreview(deviceId){
+  if(!window.isSecureContext && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
+    pvShow('Live preview needs http://localhost or HTTPS.\nControls still work over the network.');
+    pvtoggle.textContent='Start'; return;
+  }
+  if(!navigator.mediaDevices?.getUserMedia){ pvShow('This browser can’t show a camera preview.'); return; }
+  pvShow('Starting preview…');
+  try{
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream=await navigator.mediaDevices.getUserMedia({
+      video: deviceId?{deviceId:{exact:deviceId}}:{ width:{ideal:1280} }, audio:false });
+    vid.srcObject=stream; pvShow(''); pvtoggle.textContent='Stop';
+    await listCams(stream.getVideoTracks()[0]?.getSettings().deviceId);
+  }catch(e){
+    pvShow('Camera busy or blocked: '+e.name+
+      '.\nClose other apps using the camera, or allow camera access, then press Start.');
+    pvtoggle.textContent='Start';
+  }
+}
+function stopPreview(){ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  vid.srcObject=null; pvShow('Preview stopped.'); pvtoggle.textContent='Start'; }
+pvtoggle.onclick=()=> (stream?stopPreview():startPreview(camsel.value));
+camsel.onchange=()=> startPreview(camsel.value);
 
 const SPEED=40;           // pan/tilt hold speed
 function move(ps,ts){ api('/api/move',{pan_speed:ps,tilt_speed:ts}); }
@@ -422,15 +494,20 @@ function renderPresets(){
 
 function refresh(){
   return api('/api/state').then(s=>{
-    ST=s.controls; PRE=s.presets||{}; $('#dev').textContent=s.device;
+    ST=s.controls; PRE=s.presets||{};
+    $('#dev').textContent=s.device; $('#dot').classList.add('ok');
     if(ST.zoom){ const z=ST.zoom; const zi=$('#zoom');
       zi.min=z.min; zi.max=z.max; zi.step=z.step||1; zi.value=z.value; $('#zoom_v').textContent=z.value; }
     renderGroup('#focusexp',['focus_auto','focus','auto_exposure','exposure']);
     renderGroup('#image',['wb_auto','wb_temp','brightness','contrast','saturation','hue','gain','sharpness','backlight']);
     renderPresets();
+  }).catch(e=>{
+    $('#dot').classList.remove('ok');
+    $('#dev').textContent='cannot reach server';
   });
 }
 refresh();
+startPreview();   // best-effort live preview on load
 </script>
 </body></html>
 """
@@ -468,11 +545,16 @@ def main():
     Handler.cam = Camera(device)
     srv = bind_server(args.host, args.port)
     actual_port = srv.server_address[1]
+    url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{actual_port}"
+    bar = "=" * (len(url) + 14)
+    print(bar)
     if actual_port != args.port and args.port != 0:
-        print(f"Port {args.port} was busy — using {actual_port} instead.")
-    print(f"OBSBOT control on {device}")
-    print(f"  -> http://{args.host}:{actual_port}"
-          + ("   (also reachable from your LAN/phone)" if args.host == "0.0.0.0" else ""))
+        print(f"  NOTE: port {args.port} was busy — using {actual_port} instead.")
+    print(f"  OBSBOT Tiny 3 on {device}")
+    print(f"  OPEN -> {url}")
+    if args.host == "0.0.0.0":
+        print("  (also reachable from your LAN/phone at http://<this-pc-ip>:%d)" % actual_port)
+    print(bar)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
