@@ -20,6 +20,8 @@ import struct
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from tiny3_xu import Tiny3XU, AI_MODES, FOV_MODES
+
 # ---------------------------------------------------------------------------
 # V4L2 ioctl plumbing
 # ---------------------------------------------------------------------------
@@ -71,12 +73,46 @@ PRESET_KEYS = ["pan", "tilt", "zoom", "focus", "focus_auto"]
 PRESETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny3_presets.json")
 
 
+# AI tracking modes exposed in the web UI (verified on hardware; the
+# hand/whiteboard/desk modes stay CLI-only until confirmed on a Tiny 3).
+UI_AI_MODES = ["off", "normal", "upper", "closeup", "headless", "lower", "group"]
+
+
 class Camera:
     def __init__(self, device):
         self.device = device
         self.fd = os.open(device, os.O_RDWR)
         # The fd is shared across request-handler threads; serialize all ioctls.
         self._lock = threading.Lock()
+        self.xu = Tiny3XU(self.fd)
+
+    def xu_status(self):
+        """Vendor-feature state, or None if the XU doesn't answer."""
+        try:
+            with self._lock:
+                st = self.xu.decode_status()
+        except OSError:
+            return None
+        return {"ai": st["ai_mode"], "fov": st["fov"],
+                "hdr": st["hdr"], "face_ae": st["face_ae"],
+                "ai_modes": UI_AI_MODES, "fov_modes": list(FOV_MODES)}
+
+    def xu_set(self, feature, value):
+        with self._lock:
+            if feature == "ai":
+                if value not in UI_AI_MODES:
+                    raise ValueError(f"unknown AI mode {value!r}")
+                self.xu.set_ai_mode(value)
+            elif feature == "fov":
+                if value not in FOV_MODES:
+                    raise ValueError(f"unknown FOV {value!r}")
+                self.xu.set_fov(value)
+            elif feature == "hdr":
+                self.xu.set_hdr(bool(value))
+            elif feature == "face_ae":
+                self.xu.set_face_ae(bool(value))
+            else:
+                raise ValueError(f"unknown feature {feature!r}")
 
     def close(self):
         try:
@@ -243,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/state":
             self._json({"controls": self.cam.snapshot(),
                         "presets": load_presets(),
+                        "xu": self.cam.xu_status(),
                         "device": self.cam.device})
         else:
             self._json({"error": "not found"}, 404)
@@ -271,6 +308,10 @@ class Handler(BaseHTTPRequestHandler):
                 for k in ("pan", "tilt"):
                     self.cam.set(ID_BY_KEY[k], 0)
                 return self._json({"ok": True})
+
+            if self.path == "/api/xu":
+                self.cam.xu_set(data.get("feature"), data.get("value"))
+                return self._json({"ok": True, "xu": self.cam.xu_status()})
 
             if self.path == "/api/preset/save":
                 slot = str(data.get("slot"))
@@ -400,6 +441,7 @@ INDEX_HTML = r"""<!doctype html>
   .col-right .card:nth-child(2){animation-delay:.14s}
   .col-right .card:nth-child(3){animation-delay:.2s}
   .col-right .card:nth-child(4){animation-delay:.26s}
+  .col-right .card:nth-child(5){animation-delay:.32s}
   @keyframes rise{to{opacity:1;transform:none}}
   @media(prefers-reduced-motion:reduce){.card{animation:none;opacity:1;transform:none}}
   .card h2{margin:0 0 15px;font-family:var(--mono);font-size:11px;font-weight:600;
@@ -520,6 +562,18 @@ INDEX_HTML = r"""<!doctype html>
   .toggle input[type=checkbox]:checked{background:var(--acc-deep);border-color:var(--acc)}
   .toggle input[type=checkbox]:checked::after{transform:translateX(19px);background:#04130f}
 
+  /* ---------- AI & lens ---------- */
+  .modegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(84px,1fr));gap:8px;margin-bottom:15px}
+  .modegrid button{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+    padding:11px 4px;border-radius:10px;color:var(--mut)}
+  .modegrid button.on{color:#04130f;background:var(--acc);border-color:var(--acc);font-weight:600;
+    box-shadow:0 0 18px -6px var(--acc)}
+  .ainote{display:none;margin-top:13px;padding:9px 12px;border-radius:9px;text-align:center;
+    font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--acc);background:var(--acc-soft);border:1px dashed rgba(47,224,192,.35)}
+  .ai-live .ainote{display:block}
+  .ai-live .padwrap,.ai-live .speedrow{opacity:.35;pointer-events:none}
+
   /* ---------- presets ---------- */
   .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
   .presets .slot{display:grid;gap:7px;text-align:center}
@@ -613,6 +667,14 @@ INDEX_HTML = r"""<!doctype html>
       <div class="kbd">
         <b>←↑↓→</b> move · <b>+</b><b>−</b> zoom · <b>C</b> center · <b>1</b>–<b>4</b> preset · <b>⇧1</b>–<b>4</b> save
       </div>
+      <div class="ainote">AI tracking is steering — set it to OFF for manual moves</div>
+    </div>
+
+    <div class="card" id="xucard" style="display:none">
+      <h2>AI Tracking &amp; Lens</h2>
+      <div class="modegrid" id="aimodes"></div>
+      <div class="row menu-row"><label>Field of view</label><div class="seg" id="fovseg"></div></div>
+      <div id="xutoggles"></div>
     </div>
 
     <div class="card">
@@ -643,7 +705,8 @@ async function api(p,b){
   if(!r.ok||j.error) throw new Error(j.error||('HTTP '+r.status));
   return j;
 }
-let ST={}, PRE={};
+let ST={}, PRE={}, XU=null;
+const aiActive=()=>XU&&XU.ai!=='off';
 const GROUPS={focusexp:['focus_auto','focus','auto_exposure','exposure'],
               image:['wb_auto','wb_temp','brightness','contrast','saturation','hue','gain','sharpness','backlight']};
 
@@ -719,6 +782,7 @@ function ptzTick(){
   });
 }
 function move(px,ty){ // px,ty in -1..1; (0,0) stops
+  if(aiActive()&&(px||ty)){ toast('AI tracking is steering — set it to Off first','err'); return; }
   ptDir=[px,ty];
   document.querySelectorAll('.pad button[data-dir]').forEach(b=>{
     const [bx,by]=DIRS[b.dataset.dir]; b.classList.toggle('held',!!(px||ty)&&bx===px&&by===ty); });
@@ -831,6 +895,48 @@ $('#zoom').onchange=()=>{ $('#zoom_v').textContent=$('#zoom').value; setKey('zoo
 $('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value;
   $('#t_zoom').textContent=$('#zoom').value+'%'; fill($('#zoom')); };
 
+/* ---- AI tracking & lens (vendor XU) ---- */
+const AI_LABELS={off:'Off',normal:'Human',upper:'Upper body',closeup:'Close-up',
+                 headless:'Headless',lower:'Lower body',group:'Group'};
+const FOV_LABELS={wide:'Wide 86°',medium:'Med 78°',narrow:'Narrow 65°'};
+function xuSet(feature,value){
+  XU[feature]=value; renderXU();       // optimistic — the poll confirms
+  return api('/api/xu',{feature,value}).then(r=>{
+    if(r.xu){ if(String(r.xu[feature]).startsWith('unknown')) r.xu[feature]=value; XU=r.xu; }
+    renderXU(); setTimeout(refresh,1600);   // re-read once the mode change settles
+  }).catch(e=>{oops(e);refresh();});
+}
+function xuToggleRow(label,feature){
+  const wrap=document.createElement('div'); wrap.className='row toggle-row';
+  const lab=document.createElement('label'); lab.textContent=label;
+  const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!!XU[feature];
+  cb.onchange=()=>xuSet(feature,cb.checked);
+  const t=document.createElement('div'); t.className='toggle'; t.append(cb);
+  wrap.append(lab,t); return wrap;
+}
+function renderXU(){
+  const card=$('#xucard');
+  if(!XU){ card.style.display='none'; $('#ptzcard').classList.remove('ai-live'); return; }
+  card.style.display='';
+  $('#ptzcard').classList.toggle('ai-live',aiActive());
+  const grid=$('#aimodes'); grid.innerHTML='';
+  (XU.ai_modes||[]).forEach(m=>{
+    const b=document.createElement('button'); b.textContent=AI_LABELS[m]||m;
+    b.classList.toggle('on',XU.ai===m);
+    b.onclick=()=>xuSet('ai',m);
+    grid.append(b);
+  });
+  const seg=$('#fovseg'); seg.innerHTML='';
+  (XU.fov_modes||[]).forEach(m=>{
+    const b=document.createElement('button'); b.textContent=FOV_LABELS[m]||m;
+    b.classList.toggle('on',XU.fov===m);
+    b.onclick=()=>xuSet('fov',m);
+    seg.append(b);
+  });
+  const tg=$('#xutoggles'); tg.innerHTML='';
+  tg.append(xuToggleRow('HDR','hdr'),xuToggleRow('Face-priority exposure','face_ae'));
+}
+
 /* ---- presets: go / save / rename ---- */
 function renderPresets(){
   const el=$('#presets'); el.innerHTML='';
@@ -903,8 +1009,8 @@ let lastSnap='';
 function refresh(){
   return api('/api/state').then(s=>{
     $('#dev').textContent=s.device; $('#dot').classList.add('ok');
-    const snap=JSON.stringify([s.controls,s.presets]);
-    ST=s.controls; PRE=s.presets||{};
+    const snap=JSON.stringify([s.controls,s.presets,s.xu]);
+    ST=s.controls; PRE=s.presets||{}; XU=s.xu;
     if(!ptTimer){ TARGET.pan=ST.pan?.value; TARGET.tilt=ST.tilt?.value; }
     updateHUD();
     if(snap===lastSnap) return;         // nothing changed → don't rebuild the DOM
@@ -914,6 +1020,7 @@ function refresh(){
     renderGroup('focusexp',GROUPS.focusexp);
     renderGroup('image',GROUPS.image);
     renderPresets();
+    renderXU();
   }).catch(e=>{
     $('#dot').classList.remove('ok');
     $('#dev').textContent='cannot reach server';

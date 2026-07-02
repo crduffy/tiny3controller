@@ -10,27 +10,29 @@ github.com/samliddicott/meet4k) and verified on real Tiny 3 hardware 2026-07-02:
 
   * GET_LEN on selectors 2 and 6 returns 60 — every payload is a 60-byte buffer.
   * Selector 6 is a register RPC, no checksum: SET_CUR [reg, nbytes, values...].
-  * GET_CUR on selector 6 returns a 60-byte status block; on the Tiny 3,
-    byte 0x04 tracks the FOV setting and byte 0x18 the AI mode (verified).
+  * GET_CUR on selector 6 returns a 60-byte status block; on the Tiny 3:
+    byte 0x04 = FOV (0x00 wide / 0x06 medium / 0x0f narrow), 0x06 = HDR,
+    0x07 = face-AE, 0x18 = AI mode major, 0x1C = AI mode minor. All verified.
+    (0x18 briefly reads a transient value while a mode change settles.)
   * Selector 2 carries framed "AA 25" packets WITH a checksum (sleep/wake,
     exposure setup). Those are replay-only — do not hand-craft them.
 
-Verified working on the Tiny 3 (visually confirmed + status read-back):
+Verified working on the Tiny 3 (status read-back and/or visible effect):
     FOV      reg 0x04: 0=wide(86°) 1=medium(78°) 2=narrow(65°)  ← SDK mapping
     AI mode  reg 0x16: [0x16, 2, major, minor]; disable + normal tracking tested,
              status byte 0x18 reflects the major mode.
+    HDR      reg 0x01: [0x01, 1, 0|1]; status byte 0x06 follows.
+    Face-AE  reg 0x03: [0x03, 1, 0|1]; status byte 0x07 follows (default on).
 
 Plausible but NOT yet verified on a Tiny 3 (same grammar on Tiny 2/Meet 4K):
-    HDR      reg 0x01: [0x01, 1, 0|1]
-    Face-AE  reg 0x03: [0x03, 1, 0|1]
-    Other AI modes: hand(3), whiteboard(4), desk(5) as the major byte.
+    AI modes hand(3), whiteboard(4), desk(5) as the major byte.
 
 Usage as CLI:
     python3 tiny3_xu.py status                 # decode + hex-dump selector 6
     python3 tiny3_xu.py ai off|normal|upper|closeup|headless|lower|group
     python3 tiny3_xu.py fov wide|medium|narrow
-    python3 tiny3_xu.py hdr on|off             # unverified on Tiny 3
-    python3 tiny3_xu.py face-ae on|off         # unverified on Tiny 3
+    python3 tiny3_xu.py hdr on|off
+    python3 tiny3_xu.py face-ae on|off
     python3 tiny3_xu.py raw 16 02 02 00        # SET_CUR selector 6, hex bytes
 
 All of these are soft settings — idempotent, and recoverable from the OBSBOT
@@ -108,7 +110,6 @@ class Tiny3XU:
     def set_fov(self, name):
         self.send([0x04, 0x01, FOV_MODES[name]])
 
-    # -- same grammar, not yet verified on a Tiny 3 ---------------------------
     def set_hdr(self, on):
         self.send([0x01, 0x01, 1 if on else 0])
 
@@ -117,11 +118,16 @@ class Tiny3XU:
 
     def decode_status(self):
         s = self.get_status()
-        ai = {v[0]: k for k, v in AI_MODES.items()}
+        ai = {v: k for k, v in AI_MODES.items()}
+        fov = {0x00: "wide", 0x06: "medium", 0x0F: "narrow"}
+        major, minor = s[0x18], s[0x1C]
         return {
-            "fov_raw": s[0x04],          # 0x00 wide / 0x06 medium / 0x0f narrow
-            "ai_major": s[0x18],
-            "ai_mode": ai.get(s[0x18], f"unknown({s[0x18]})"),
+            "fov_raw": s[0x04],
+            "fov": fov.get(s[0x04], "wide"),
+            "hdr": bool(s[0x06]),
+            "face_ae": bool(s[0x07]),
+            "ai_major": major,
+            "ai_mode": ai.get((major, minor), f"unknown({major},{minor})"),
             "raw": s,
         }
 
@@ -168,7 +174,9 @@ def main():
             st = xu.decode_status()
             print(f"device   : {device}")
             print(f"ai mode  : {st['ai_mode']} (major={st['ai_major']})")
-            print(f"fov raw  : 0x{st['fov_raw']:02x}")
+            print(f"fov      : {st['fov']} (raw 0x{st['fov_raw']:02x})")
+            print(f"hdr      : {'on' if st['hdr'] else 'off'}")
+            print(f"face-ae  : {'on' if st['face_ae'] else 'off'}")
             raw = st["raw"]
             for off in range(0, len(raw), 16):
                 print(f"  {off:04x}  " + " ".join(f"{x:02x}" for x in raw[off:off+16]))
@@ -180,10 +188,10 @@ def main():
             print(f"FOV -> {args.mode}")
         elif args.cmd == "hdr":
             xu.set_hdr(args.mode == "on")
-            print(f"HDR -> {args.mode} (unverified on Tiny 3 — check the image)")
+            print(f"HDR -> {args.mode}")
         elif args.cmd == "face-ae":
             xu.set_face_ae(args.mode == "on")
-            print(f"Face-AE -> {args.mode} (unverified on Tiny 3)")
+            print(f"Face-AE -> {args.mode}")
         elif args.cmd == "raw":
             payload = [int(x, 16) for x in args.bytes]
             xu.send(payload)

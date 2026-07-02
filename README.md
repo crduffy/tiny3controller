@@ -23,6 +23,10 @@ pan/tilt/zoom HUD is shown at the top of the page.
   section header has a `reset` button for the whole group.
 - **Presets** — `save` stores the current pan/tilt/zoom/focus; click the big
   button to recall; `rename` gives a slot a label.
+- **AI Tracking & Lens** — AI tracking modes (Off / Human / Upper body /
+  Close-up / Headless / Lower body / Group), field of view (86°/78°/65°), HDR
+  and face-priority exposure, all via the vendor XU (see below). While AI
+  tracking is on, the camera steers itself, so the manual pad is disabled.
 - The page polls the camera every 2.5 s, so changes made by other apps show up.
 
 ### Live preview
@@ -49,11 +53,12 @@ family (`cgevans/tiny2`, `mitchelloharawild/obsbot-tiny-2-control`,
   `SET_CUR [reg, nbytes, values…]`; `GET_CUR` returns a status block
   (byte `0x18` = AI mode, byte `0x04` tracks FOV).
 - **Verified working:** AI tracking (`reg 0x16`: off / normal / upper-body /
-  close-up / headless / lower-body / group) and FOV
+  close-up / headless / lower-body / group; status bytes 0x18/0x1C), FOV
   (`reg 0x04`: 0 wide 86° / 1 medium 78° / 2 narrow 65° — the SDK enum mapping,
-  which settles the conflicting mappings floating around the Tiny 2 projects).
-- **Same grammar, not yet verified here:** HDR (`reg 0x01`), face-AE
-  (`reg 0x03`), and the hand/whiteboard/desk AI modes.
+  which settles the conflicting mappings floating around the Tiny 2 projects),
+  HDR (`reg 0x01`, status byte 0x06) and face-AE (`reg 0x03`, status byte 0x07).
+- **Same grammar, not yet verified here:** the hand/whiteboard/desk AI modes
+  (CLI-only for now).
 - **Capture/replay only** (framed `AA 25` packets with a checksum on
   selector 2): sleep/wake, camera-side presets. Gesture toggles and tracking
   speed need a usbmon capture of the official app to learn their register ids.
