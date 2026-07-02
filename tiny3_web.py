@@ -31,6 +31,7 @@ def _iowr(nr, size):
     return ((_IOC_READ | _IOC_WRITE) << 30) | (size << 16) | (ord('V') << 8) | nr
 
 VIDIOC_QUERYCTRL = _iowr(36, 68)   # struct v4l2_queryctrl  (68 bytes)
+VIDIOC_QUERYMENU = _iowr(37, 44)   # struct v4l2_querymenu  (44 bytes, packed)
 VIDIOC_G_CTRL    = _iowr(27, 8)    # struct v4l2_control    (8 bytes)
 VIDIOC_S_CTRL    = _iowr(28, 8)
 
@@ -39,6 +40,8 @@ _CTRL_FMT  = "=Ii"
 # struct v4l2_queryctrl { u32 id; u32 type; char name[32]; s32 min,max,step,def;
 #                         u32 flags; u32 reserved[2]; }
 _QUERY_FMT = "=II32siiiII8x"
+# struct v4l2_querymenu { u32 id; u32 index; char name[32]; u32 reserved; } (packed)
+_QMENU_FMT = "=II32sI"
 
 # Controls we expose, in display order. (v4l2 id, key, label, group)
 CONTROLS = [
@@ -49,10 +52,10 @@ CONTROLS = [
     (0x009A0921, "tilt_speed", "Tilt speed",     "ptz"),
     (0x009A090A, "focus",      "Focus",          "focus"),
     (0x009A090C, "focus_auto", "Auto focus",     "focus"),
-    (0x009A0901, "auto_exposure", "Auto exposure", "exposure"),
-    (0x009A0902, "exposure",   "Exposure time",  "exposure"),
+    (0x009A0901, "auto_exposure", "Exposure mode", "exposure"),
+    (0x009A0902, "exposure",   "Exposure",       "exposure"),
     (0x0098090C, "wb_auto",    "Auto white bal", "color"),
-    (0x0098091A, "wb_temp",    "WB temperature", "color"),
+    (0x0098091A, "wb_temp",    "WB temp",        "color"),
     (0x00980900, "brightness", "Brightness",     "image"),
     (0x00980901, "contrast",   "Contrast",       "image"),
     (0x00980902, "saturation", "Saturation",     "image"),
@@ -100,6 +103,20 @@ class Camera:
             "inactive": bool(flags & 0x0010),
         }
 
+    def query_menu(self, cid, mn, mx):
+        """For a menu control, return {value: label} for each valid entry."""
+        items = {}
+        for idx in range(mn, mx + 1):
+            buf = bytearray(struct.pack(_QMENU_FMT, cid, idx, b"", 0))
+            try:
+                with self._lock:
+                    fcntl.ioctl(self.fd, VIDIOC_QUERYMENU, buf, True)
+            except OSError:
+                continue  # gap in the menu (e.g. exposure_auto only has 1 and 3)
+            _id, _idx, name, _res = struct.unpack(_QMENU_FMT, bytes(buf))
+            items[idx] = name.split(b"\x00")[0].decode(errors="replace")
+        return items
+
     def get(self, cid):
         buf = bytearray(struct.pack(_CTRL_FMT, cid, 0))
         try:
@@ -123,12 +140,15 @@ class Camera:
             q = self.query(cid)
             if not q:
                 continue
-            out[key] = {
+            c = {
                 "id": cid, "label": label, "group": group,
                 "min": q["min"], "max": q["max"], "step": q["step"],
                 "default": q["default"], "type": q["type"], "value": self.get(cid),
                 "inactive": q["inactive"],
             }
+            if q["type"] == 3:  # V4L2_CTRL_TYPE_MENU
+                c["menu"] = self.query_menu(cid, q["min"], q["max"])
+            out[key] = c
         return out
 
 
@@ -137,11 +157,21 @@ class Camera:
 # ---------------------------------------------------------------------------
 
 def load_presets():
+    """Presets normalized to {slot: {"name": str, "values": {key: val}}}."""
     try:
         with open(PRESETS_FILE) as f:
-            return json.load(f)
+            raw = json.load(f)
     except (OSError, ValueError):
         return {}
+    out = {}
+    for slot, p in raw.items():
+        if not isinstance(p, dict):
+            continue
+        if "values" in p:
+            out[slot] = {"name": p.get("name") or "", "values": p["values"]}
+        else:  # legacy flat format
+            out[slot] = {"name": "", "values": p}
+    return out
 
 def save_presets(p):
     with open(PRESETS_FILE, "w") as f:
@@ -246,16 +276,26 @@ class Handler(BaseHTTPRequestHandler):
                 slot = str(data.get("slot"))
                 snap = {k: self.cam.get(ID_BY_KEY[k]) for k in PRESET_KEYS if k in ID_BY_KEY}
                 presets = load_presets()
-                presets[slot] = snap
+                old_name = presets.get(slot, {}).get("name", "")
+                presets[slot] = {"name": data.get("name") or old_name, "values": snap}
                 save_presets(presets)
-                return self._json({"slot": slot, "saved": snap})
+                return self._json({"slot": slot, "saved": presets[slot]})
+
+            if self.path == "/api/preset/rename":
+                slot = str(data.get("slot"))
+                presets = load_presets()
+                if slot not in presets:
+                    return self._json({"error": "empty slot"}, 404)
+                presets[slot]["name"] = str(data.get("name", ""))[:24]
+                save_presets(presets)
+                return self._json({"slot": slot, "name": presets[slot]["name"]})
 
             if self.path == "/api/preset/go":
                 slot = str(data.get("slot"))
                 presets = load_presets()
                 if slot not in presets:
                     return self._json({"error": "empty slot"}, 404)
-                saved = presets[slot]
+                saved = presets[slot]["values"]
                 # Apply auto/master toggles first; skip manual controls that the
                 # restored auto mode makes inactive; never let one failed control
                 # abort the rest of the restore.
@@ -290,10 +330,10 @@ INDEX_HTML = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Sora:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#080a0e; --bg2:#0b0e13;
+    --bg:#080a0e;
     --fg:#eaf0f6; --mut:#7e8a9c; --mut2:#5d6878;
     --acc:#2fe0c0; --acc-deep:#13b89c; --acc-soft:rgba(47,224,192,.14);
-    --live:#ff5b6e;
+    --live:#ff5b6e; --warn:#ffb454;
     --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.12);
     --surface:linear-gradient(168deg,#161b23 0%,#10141b 60%,#0d1118 100%);
     --shadow:0 18px 40px -22px rgba(0,0,0,.85);
@@ -333,8 +373,10 @@ INDEX_HTML = r"""<!doctype html>
     color:var(--acc);text-transform:uppercase;margin-top:1px}
   .status{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;
     letter-spacing:.1em;text-transform:uppercase;color:var(--mut);
-    padding:7px 13px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.02)}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--live);box-shadow:0 0 0 0 rgba(255,91,110,.6)}
+    padding:7px 13px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.02);
+    max-width:46vw;overflow:hidden}
+  .status #dev{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--live);box-shadow:0 0 0 0 rgba(255,91,110,.6)}
   .dot.ok{background:var(--acc);animation:pulse 2.4s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(47,224,192,.5)}70%{box-shadow:0 0 0 7px rgba(47,224,192,0)}100%{box-shadow:0 0 0 0 rgba(47,224,192,0)}}
 
@@ -357,12 +399,18 @@ INDEX_HTML = r"""<!doctype html>
   .col-right .card:nth-child(1){animation-delay:.08s}
   .col-right .card:nth-child(2){animation-delay:.14s}
   .col-right .card:nth-child(3){animation-delay:.2s}
+  .col-right .card:nth-child(4){animation-delay:.26s}
   @keyframes rise{to{opacity:1;transform:none}}
   @media(prefers-reduced-motion:reduce){.card{animation:none;opacity:1;transform:none}}
   .card h2{margin:0 0 15px;font-family:var(--mono);font-size:11px;font-weight:600;
     letter-spacing:.22em;text-transform:uppercase;color:var(--mut);display:flex;align-items:center;gap:9px}
   .card h2::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--acc);
     box-shadow:0 0 8px var(--acc)}
+  .card h2 .spacer{flex:1}
+  .hbtn{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--mut2);background:none;border:1px solid transparent;border-radius:8px;
+    padding:4px 9px;cursor:pointer;transition:color .15s,border-color .15s}
+  .hbtn:hover{color:var(--acc);border-color:rgba(47,224,192,.3)}
 
   /* ---------- preview ---------- */
   .preview-wrap{position:relative;background:#000;border-radius:13px;overflow:hidden;aspect-ratio:16/9;
@@ -390,6 +438,13 @@ INDEX_HTML = r"""<!doctype html>
   .live::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--live);
     box-shadow:0 0 8px var(--live);animation:pulse 1.6s infinite}
   .live.on{display:flex}
+  /* viewfinder HUD: live pan/tilt/zoom telemetry over the video */
+  .hud{position:absolute;left:12px;right:12px;bottom:12px;display:flex;gap:8px;pointer-events:none}
+  .hud span{display:flex;align-items:baseline;gap:6px;font-family:var(--mono);
+    padding:5px 10px;border-radius:6px;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);
+    border:1px solid rgba(255,255,255,.1)}
+  .hud em{font-style:normal;font-size:9px;letter-spacing:.24em;color:var(--mut)}
+  .hud b{font-weight:600;font-size:12px;color:var(--acc);font-variant-numeric:tabular-nums}
   .pvbar{display:flex;gap:9px;align-items:center;margin-top:13px}
   select,.btn{font-family:var(--body);color:var(--fg);background:rgba(255,255,255,.04);
     border:1px solid var(--line2);border-radius:10px;padding:10px 12px;font-size:13px;cursor:pointer}
@@ -409,28 +464,42 @@ INDEX_HTML = r"""<!doctype html>
     padding:10px 16px;color:var(--acc);border-color:rgba(47,224,192,.35);background:var(--acc-soft)}
 
   /* ---------- PTZ pad ---------- */
-  .padwrap{display:flex;justify-content:center;margin:4px 0 18px}
+  .padwrap{display:flex;justify-content:center;margin:4px 0 14px}
   .pad{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);
-    gap:9px;width:min(232px,72vw);aspect-ratio:1;padding:16px;border-radius:50%;
+    gap:9px;width:min(240px,74vw);aspect-ratio:1;padding:16px;border-radius:50%;
     background:radial-gradient(circle at 50% 38%,rgba(47,224,192,.07),rgba(255,255,255,.015) 55%,transparent 72%);
     border:1px solid var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.05),var(--shadow)}
-  .pad span{pointer-events:none}
-  .pad button{display:flex;align-items:center;justify-content:center;font-size:20px;border-radius:14px;
+  .pad button{display:flex;align-items:center;justify-content:center;font-size:19px;border-radius:16px;
     color:var(--acc);background:rgba(255,255,255,.04)}
-  .pad button[data-dir]{border-radius:16px}
-  .pad button[data-dir]:active{background:var(--acc);color:#04130f;border-color:var(--acc);
-    box-shadow:0 0 22px -4px var(--acc)}
+  .pad button.diag{font-size:13px;color:var(--mut);border-radius:14px}
+  .pad button[data-dir]:active,.pad button[data-dir].held{background:var(--acc);color:#04130f;
+    border-color:var(--acc);box-shadow:0 0 22px -4px var(--acc)}
   #center{border-radius:50%;font-size:18px;color:var(--mut);font-family:var(--mono)}
   #center:hover{color:var(--acc)}
+
+  /* ---------- segmented control ---------- */
+  .seg{display:flex;gap:0;border:1px solid var(--line2);border-radius:10px;overflow:hidden;
+    background:rgba(255,255,255,.03)}
+  .seg button{flex:1;border:none;border-radius:0;padding:8px 6px;font-family:var(--mono);
+    font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut)}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button.on{background:var(--acc-deep);color:#04130f;font-weight:600}
+  .speedrow{display:grid;grid-template-columns:auto 1fr;gap:11px;align-items:center;margin-bottom:14px}
+  .speedrow .zlab{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut)}
 
   /* ---------- zoom + control rows ---------- */
   .zoomrow{display:grid;grid-template-columns:auto 42px 1fr 44px 42px;gap:11px;align-items:center}
   .zoomrow .zlab{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut)}
   .zoomrow button{padding:8px 0;font-size:18px;border-radius:10px}
-  .row{display:grid;grid-template-columns:118px 1fr 50px;align-items:center;gap:14px;margin:13px 0}
+  .row{display:grid;grid-template-columns:118px 1fr 54px;align-items:center;gap:14px;margin:13px 0}
   .row:first-child{margin-top:4px}
-  .row label{font-size:13px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .row .val{font-family:var(--mono);font-size:13px;text-align:right;color:var(--acc);font-variant-numeric:tabular-nums}
+  .row label{font-size:13px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+  .row .val{font-family:var(--mono);font-size:13px;text-align:right;color:var(--acc);
+    font-variant-numeric:tabular-nums;cursor:text;border-radius:6px;padding:2px 4px}
+  .row .val:hover{background:rgba(47,224,192,.08)}
+  .row .val input{width:100%;font:inherit;color:inherit;background:rgba(0,0,0,.4);
+    border:1px solid var(--acc-deep);border-radius:6px;text-align:right;padding:1px 3px;outline:none}
+  .row.menu-row{grid-template-columns:118px 1fr}
   input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:5px;border-radius:99px;
     background:linear-gradient(90deg,var(--acc-deep),var(--acc)) no-repeat,rgba(255,255,255,.1);
     background-size:var(--fill,50%) 100%;cursor:pointer}
@@ -438,6 +507,9 @@ INDEX_HTML = r"""<!doctype html>
     background:#eafff9;border:3px solid var(--acc-deep);box-shadow:0 2px 6px rgba(0,0,0,.5);margin-top:0}
   input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#eafff9;border:3px solid var(--acc-deep)}
   input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+  .row.off label,.row.off .val{opacity:.45}
+  .autotag{font-family:var(--mono);font-size:9px;letter-spacing:.14em;color:var(--mut2);
+    text-transform:uppercase;margin-left:6px}
   /* toggle rows: switch on the right */
   .toggle-row{grid-template-columns:1fr auto}
   .toggle-row label{color:var(--fg)}
@@ -451,12 +523,33 @@ INDEX_HTML = r"""<!doctype html>
   /* ---------- presets ---------- */
   .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
   .presets .slot{display:grid;gap:7px;text-align:center}
-  .presets .go{font-family:var(--mono);font-size:15px;letter-spacing:.06em;padding:15px 0;font-weight:600}
+  .presets .go{font-family:var(--mono);font-size:13px;letter-spacing:.04em;padding:15px 4px;font-weight:600;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .presets .go.filled{color:var(--acc);border-color:rgba(47,224,192,.4);background:var(--acc-soft)}
   .presets .save{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;
     padding:7px 0;color:var(--mut)}
-  .presets small{font-family:var(--mono);font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut2)}
+  .presets .pname{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--mut2);border:none;background:none;padding:2px 0;cursor:text}
+  .presets .pname:hover{color:var(--acc)}
+  .presets input.pname{color:var(--fg);background:rgba(0,0,0,.4);border:1px solid var(--acc-deep);
+    border-radius:6px;text-align:center;outline:none;text-transform:none;letter-spacing:.05em;font-size:11px;width:100%}
   @media(max-width:380px){.presets{grid-template-columns:repeat(2,1fr)}}
+
+  /* ---------- keyboard hint ---------- */
+  .kbd{margin-top:13px;text-align:center;font-family:var(--mono);font-size:10px;
+    letter-spacing:.08em;color:var(--mut2);line-height:2}
+  .kbd b{font-weight:500;color:var(--mut);background:rgba(255,255,255,.05);
+    border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;margin:0 1px}
+  @media(hover:none){.kbd{display:none}}
+
+  /* ---------- toast ---------- */
+  #toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,80px);z-index:50;
+    font-family:var(--mono);font-size:12px;letter-spacing:.06em;max-width:88vw;
+    padding:10px 18px;border-radius:10px;background:rgba(14,17,23,.95);border:1px solid var(--line2);
+    color:var(--fg);box-shadow:var(--shadow);opacity:0;transition:transform .25s,opacity .25s;pointer-events:none}
+  #toast.show{transform:translate(-50%,0);opacity:1}
+  #toast.err{border-color:rgba(255,91,110,.5);color:#ffd7dc}
+  #toast.okc{border-color:rgba(47,224,192,.45);color:#d8fff6}
 </style></head>
 <body>
 <header>
@@ -473,6 +566,11 @@ INDEX_HTML = r"""<!doctype html>
       <div class="preview-wrap">
         <video id="preview" autoplay playsinline muted></video>
         <div class="live" id="live">LIVE</div>
+        <div class="hud">
+          <span><em>PAN</em><b id="t_pan">–</b></span>
+          <span><em>TILT</em><b id="t_tilt">–</b></span>
+          <span><em>ZOOM</em><b id="t_zoom">–</b></span>
+        </div>
         <div class="preview-msg" id="pvmsg">Starting preview…</div>
       </div>
       <div class="pvbar">
@@ -487,45 +585,74 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Pan · Tilt · Zoom</h2>
       <div class="padwrap">
         <div class="pad">
-          <span></span>
+          <button data-dir="ul" class="diag">◤</button>
           <button data-dir="up">▲</button>
-          <span></span>
+          <button data-dir="ur" class="diag">◥</button>
           <button data-dir="left">◄</button>
-          <button id="center">⌂</button>
+          <button id="center" title="Re-center pan/tilt">⌂</button>
           <button data-dir="right">►</button>
-          <span></span>
+          <button data-dir="dl" class="diag">◣</button>
           <button data-dir="down">▼</button>
-          <span></span>
+          <button data-dir="dr" class="diag">◢</button>
+        </div>
+      </div>
+      <div class="speedrow">
+        <span class="zlab">Speed</span>
+        <div class="seg" id="speedseg">
+          <button data-spd=".25">Slow</button>
+          <button data-spd=".6" class="on">Normal</button>
+          <button data-spd="1">Fast</button>
         </div>
       </div>
       <div class="zoomrow">
         <span class="zlab">Zoom</span>
-        <button data-zoom="-1">−</button>
+        <button data-zoom="-1" title="Hold to zoom out">−</button>
         <input type="range" id="zoom"><span class="val" id="zoom_v">–</span>
-        <button data-zoom="1">+</button>
+        <button data-zoom="1" title="Hold to zoom in">+</button>
       </div>
-    </div>
-
-    <div class="card">
-      <h2>Focus &amp; Exposure</h2>
-      <div id="focusexp"></div>
-    </div>
-
-    <div class="card">
-      <h2>Color &amp; Image</h2>
-      <div id="image"></div>
+      <div class="kbd">
+        <b>←↑↓→</b> move · <b>+</b><b>−</b> zoom · <b>C</b> center · <b>1</b>–<b>4</b> preset · <b>⇧1</b>–<b>4</b> save
+      </div>
     </div>
 
     <div class="card">
       <h2>Presets</h2>
       <div class="presets" id="presets"></div>
     </div>
+
+    <div class="card">
+      <h2>Focus &amp; Exposure <span class="spacer"></span>
+        <button class="hbtn" data-reset="focusexp" title="Reset this section to camera defaults">reset</button></h2>
+      <div id="focusexp"></div>
+    </div>
+
+    <div class="card">
+      <h2>Color &amp; Image <span class="spacer"></span>
+        <button class="hbtn" data-reset="image" title="Reset this section to camera defaults">reset</button></h2>
+      <div id="image"></div>
+    </div>
   </section>
 </main>
+<div id="toast"></div>
 <script>
-const $=s=>document.querySelector(s), api=(p,b)=>fetch(p,{method:b?'POST':'GET',
-  headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined}).then(r=>r.json());
+const $=s=>document.querySelector(s);
+async function api(p,b){
+  const r=await fetch(p,{method:b?'POST':'GET',
+    headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});
+  const j=await r.json();
+  if(!r.ok||j.error) throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
 let ST={}, PRE={};
+const GROUPS={focusexp:['focus_auto','focus','auto_exposure','exposure'],
+              image:['wb_auto','wb_temp','brightness','contrast','saturation','hue','gain','sharpness','backlight']};
+
+/* ---- toast feedback ---- */
+let toastT=null;
+function toast(msg,cls){ const t=$('#toast'); t.textContent=msg;
+  t.className='show '+(cls||''); clearTimeout(toastT);
+  toastT=setTimeout(()=>t.className='',2200); }
+const oops=e=>toast(e.message||String(e),'err');
 
 /* ---- live preview via the browser's own camera access (getUserMedia) ---- */
 let stream=null;
@@ -569,38 +696,81 @@ function stopPreview(){ if(stream){stream.getTracks().forEach(t=>t.stop());strea
 pvtoggle.onclick=()=> (stream?stopPreview():startPreview(camsel.value));
 camsel.onchange=()=> startPreview(camsel.value);
 
-const SPEED=40;           // pan/tilt hold speed
-function move(ps,ts){ api('/api/move',{pan_speed:ps,tilt_speed:ts}); }
-function bindHold(btn,ps,ts){
-  const start=e=>{e.preventDefault();move(ps,ts);};
-  const stop =e=>{e.preventDefault();move(0,0);};
-  btn.addEventListener('pointerdown',start);
-  btn.addEventListener('pointerup',stop);
-  btn.addEventListener('pointerleave',stop);
-  btn.addEventListener('pointercancel',stop);
-}
-const DIRS={up:[0,1],down:[0,-1],left:[-1,0],right:[1,0]};
-document.querySelectorAll('.pad button[data-dir]').forEach(b=>{
-  const [px,ty]=DIRS[b.dataset.dir]; bindHold(b,px*SPEED,ty*SPEED);
+/* ---- PTZ pad: hold to move (pointer or arrow keys), speed from segmented.
+   The Tiny 3 never reports back positions reached via the pan/tilt SPEED
+   controls, which would silently corrupt the HUD and saved presets — so we
+   step the ABSOLUTE pan/tilt targets instead; the camera glides to each. ---- */
+let speedFrac=.6;
+document.querySelectorAll('#speedseg button').forEach(b=>{
+  b.onclick=()=>{ speedFrac=+b.dataset.spd;
+    document.querySelectorAll('#speedseg button').forEach(x=>x.classList.toggle('on',x===b)); };
 });
-$('#center').onclick=()=>api('/api/center',{}).then(refresh);
+const DIRS={up:[0,1],down:[0,-1],left:[-1,0],right:[1,0],
+            ul:[-1,1],ur:[1,1],dl:[-1,-1],dr:[1,-1]};
+let ptTimer=null, ptDir=[0,0];
+const TARGET={pan:null,tilt:null};      // last position we commanded
+function ptzTick(){
+  const stepsPerTick=speedFrac===1?7:speedFrac===.6?3:1;
+  [['pan',ptDir[0]],['tilt',ptDir[1]]].forEach(([k,d])=>{
+    if(!d)return; const c=ST[k]; if(!c)return;
+    if(TARGET[k]==null) TARGET[k]=c.value??0;
+    const v=Math.max(c.min,Math.min(c.max,TARGET[k]+d*stepsPerTick*(c.step||3600)));
+    if(v!==TARGET[k]){ TARGET[k]=v; c.value=v; setKey(k,v); updateHUD(); }
+  });
+}
+function move(px,ty){ // px,ty in -1..1; (0,0) stops
+  ptDir=[px,ty];
+  document.querySelectorAll('.pad button[data-dir]').forEach(b=>{
+    const [bx,by]=DIRS[b.dataset.dir]; b.classList.toggle('held',!!(px||ty)&&bx===px&&by===ty); });
+  if(px||ty){ if(!ptTimer){ ptzTick(); ptTimer=setInterval(ptzTick,150); } }
+  else if(ptTimer){ clearInterval(ptTimer); ptTimer=null; }
+}
+document.querySelectorAll('.pad button[data-dir]').forEach(b=>{
+  const [px,ty]=DIRS[b.dataset.dir];
+  const start=e=>{e.preventDefault();move(px,ty);};
+  const stop =e=>{e.preventDefault();move(0,0);};
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointerup',stop);
+  b.addEventListener('pointerleave',stop);
+  b.addEventListener('pointercancel',stop);
+});
+$('#center').onclick=()=>api('/api/center',{}).then(refresh).catch(oops);
 
-function setKey(key,value){ return api('/api/set',{key,value}); }
+function setKey(key,value){ return api('/api/set',{key,value}).catch(oops); }
 
 function fill(inp){ const r=(inp.max-inp.min)||1;
   inp.style.setProperty('--fill',(100*(inp.value-inp.min)/r)+'%'); }
 
+/* ---- control rows ---- */
+let dragging=false;
+document.addEventListener('pointerup',()=>dragging=false);
+
 function sliderRow(c){
-  const wrap=document.createElement('div'); wrap.className='row slider-row';
+  const wrap=document.createElement('div'); wrap.className='row slider-row'+(c.inactive?' off':'');
   const lab=document.createElement('label'); lab.textContent=c.label;
+  lab.title='Double-click to reset to default ('+c.default+')';
+  if(c.inactive){ const t=document.createElement('span'); t.className='autotag'; t.textContent='auto'; lab.append(t); }
   const inp=document.createElement('input'); inp.type='range';
   inp.min=c.min; inp.max=c.max; inp.step=c.step||1; inp.value=c.value??c.default;
   inp.disabled=!!c.inactive;
   const val=document.createElement('span'); val.className='val'; val.textContent=inp.value;
+  val.title='Click to type a value';
   fill(inp);
+  inp.addEventListener('pointerdown',()=>dragging=true);
   inp.oninput=()=>{val.textContent=inp.value; fill(inp);};
   inp.onchange=()=>setKey(c.key,+inp.value);
-  if(c.inactive) wrap.style.opacity=.4;
+  lab.ondblclick=()=>{ if(c.inactive) return;
+    inp.value=c.default; val.textContent=c.default; fill(inp); setKey(c.key,c.default); };
+  val.onclick=()=>{ if(c.inactive||val.querySelector('input')) return;
+    const box=document.createElement('input'); box.type='number';
+    box.min=c.min; box.max=c.max; box.step=c.step||1; box.value=inp.value;
+    val.textContent=''; val.append(box); box.focus(); box.select();
+    const commit=ok=>{ const v=Math.max(c.min,Math.min(c.max,+box.value||0));
+      val.textContent=ok?v:inp.value;
+      if(ok&&v!=+inp.value){ inp.value=v; fill(inp); setKey(c.key,v); } };
+    box.onkeydown=e=>{ if(e.key==='Enter') box.blur();
+      if(e.key==='Escape'){ box.onblur=null; commit(false); } e.stopPropagation(); };
+    box.onblur=()=>commit(true); };
   wrap.append(lab,inp,val); return wrap;
 }
 function toggleRow(c){
@@ -611,51 +781,145 @@ function toggleRow(c){
   const t=document.createElement('div'); t.className='toggle'; t.append(cb);
   wrap.append(lab,t); return wrap;
 }
-function row(c){ return c.type===2 ? toggleRow(c) : sliderRow(c); } // 2 == V4L2 boolean
-
-function renderGroup(target,keys){
-  const el=$(target); el.innerHTML='';
-  keys.forEach(k=>{ const c=ST[k]; if(c){ c.key=k; el.append(row(c)); }});
+function menuRow(c){
+  const wrap=document.createElement('div'); wrap.className='row menu-row';
+  const lab=document.createElement('label'); lab.textContent=c.label;
+  const seg=document.createElement('div'); seg.className='seg';
+  Object.entries(c.menu||{}).forEach(([v,name])=>{
+    const b=document.createElement('button');
+    b.textContent=name.replace(/\s*Mode$/i,'').replace(/Aperture Priority/i,'Aperture');
+    b.title=name;
+    if(+v===c.value) b.classList.add('on');
+    b.onclick=()=>setKey(c.key,+v).then(refresh);
+    seg.append(b);
+  });
+  wrap.append(lab,seg); return wrap;
+}
+function row(c){                       // V4L2 types: 2=boolean, 3=menu
+  if(c.type===2) return toggleRow(c);
+  if(c.type===3&&c.menu&&Object.keys(c.menu).length) return menuRow(c);
+  return sliderRow(c);
 }
 
-// zoom +/- buttons
-document.querySelectorAll('[data-zoom]').forEach(b=>{
-  b.onclick=()=>{ const c=ST.zoom; if(!c)return;
-    let v=Math.max(c.min,Math.min(c.max,(+$('#zoom').value)+ (+b.dataset.zoom)*(c.step*4||4)));
-    $('#zoom').value=v; $('#zoom_v').textContent=v; fill($('#zoom')); setKey('zoom',v); };
+function renderGroup(target,keys){
+  const el=$('#'+target); el.innerHTML='';
+  keys.forEach(k=>{ const c=ST[k]; if(c){ c.key=k; el.append(row(c)); }});
+}
+document.querySelectorAll('[data-reset]').forEach(b=>{
+  b.onclick=async()=>{ const g=b.dataset.reset;
+    for(const k of GROUPS[g]){ const c=ST[k];
+      if(c&&!c.inactive&&c.value!==c.default){ try{ await api('/api/set',{key:k,value:c.default}); }catch(e){} } }
+    toast('Section reset to defaults','okc'); refresh(); };
 });
-$('#zoom').onchange=()=>{ $('#zoom_v').textContent=$('#zoom').value; setKey('zoom',+$('#zoom').value); };
-$('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value; fill($('#zoom')); };
 
+/* ---- zoom: slider + hold-to-repeat step buttons ---- */
+function zoomStep(dir){ const c=ST.zoom; if(!c)return;
+  const zi=$('#zoom');
+  let v=Math.max(c.min,Math.min(c.max,(+zi.value)+dir*(c.step*4||4)));
+  zi.value=v; $('#zoom_v').textContent=v; $('#t_zoom').textContent=v+'%'; fill(zi); setKey('zoom',v); }
+document.querySelectorAll('[data-zoom]').forEach(b=>{
+  const dir=+b.dataset.zoom; let rep=null;
+  const start=e=>{e.preventDefault(); zoomStep(dir); rep=setInterval(()=>zoomStep(dir),160);};
+  const stop =()=>{clearInterval(rep); rep=null;};
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointerup',stop);
+  b.addEventListener('pointerleave',stop);
+  b.addEventListener('pointercancel',stop);
+});
+$('#zoom').addEventListener('pointerdown',()=>dragging=true);
+$('#zoom').onchange=()=>{ $('#zoom_v').textContent=$('#zoom').value; setKey('zoom',+$('#zoom').value); };
+$('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value;
+  $('#t_zoom').textContent=$('#zoom').value+'%'; fill($('#zoom')); };
+
+/* ---- presets: go / save / rename ---- */
 function renderPresets(){
   const el=$('#presets'); el.innerHTML='';
   for(let i=1;i<=4;i++){
     const slot=document.createElement('div'); slot.className='slot';
-    const filled=PRE[String(i)];
-    const go=document.createElement('button'); go.textContent='P'+i;
-    go.className='go'+(filled?' filled':'');
-    go.onclick=()=>api('/api/preset/go',{slot:i}).then(refresh);
+    const p=PRE[String(i)];
+    const go=document.createElement('button');
+    go.textContent=(p&&p.name)||('P'+i);
+    go.className='go'+(p?' filled':'');
+    go.title=p?'Recall preset '+i+' (key '+i+')':'Empty — press save below';
+    go.onclick=()=>gotoPreset(i);
     const save=document.createElement('button'); save.className='save'; save.textContent='save';
-    save.onclick=()=>api('/api/preset/save',{slot:i}).then(()=>refresh());
-    const lbl=document.createElement('small'); lbl.textContent=filled?'set':'empty';
-    slot.append(go,save,lbl); el.append(slot);
+    save.title='Save current pan/tilt/zoom/focus here (shift+'+i+')';
+    save.onclick=()=>savePreset(i);
+    const name=document.createElement('button'); name.className='pname';
+    name.textContent=p?'rename':'empty';
+    if(p) name.onclick=()=>{
+      const box=document.createElement('input'); box.className='pname'; box.maxLength=24;
+      box.value=p.name||''; box.placeholder='P'+i;
+      name.replaceWith(box); box.focus(); box.select();
+      const done=()=>api('/api/preset/rename',{slot:i,name:box.value.trim()})
+        .then(refresh).catch(e=>{oops(e);refresh();});
+      box.onkeydown=e=>{ if(e.key==='Enter')box.blur(); if(e.key==='Escape'){box.onblur=null;refresh();} e.stopPropagation(); };
+      box.onblur=done; };
+    slot.append(go,save,name); el.append(slot);
   }
 }
+function savePreset(i){ api('/api/preset/save',{slot:i})
+  .then(()=>{toast('Preset '+i+' saved','okc');refresh();}).catch(oops); }
+function gotoPreset(i){ if(!PRE[String(i)]) return toast('Preset '+i+' is empty — shift+'+i+' to save','err');
+  api('/api/preset/go',{slot:i}).then(r=>{
+    const errs=Object.keys(r.errors||{});
+    if(errs.length) toast('Recalled with errors: '+errs.join(', '),'err');
+    refresh(); }).catch(oops); }
 
+/* ---- keyboard control ---- */
+const held=new Set();
+const KEYDIR={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right'};
+function heldMove(){
+  let px=0,ty=0;
+  if(held.has('left'))px-=1; if(held.has('right'))px+=1;
+  if(held.has('up'))ty+=1;   if(held.has('down'))ty-=1;
+  move(px,ty);
+}
+function typing(){ const a=document.activeElement;
+  return a&&(a.tagName==='INPUT'&&a.type!=='range'||a.tagName==='SELECT'||a.tagName==='TEXTAREA'); }
+document.addEventListener('keydown',e=>{
+  if(typing())return;
+  const d=KEYDIR[e.key];
+  if(d){ e.preventDefault(); if(!held.has(d)){held.add(d);heldMove();} return; }
+  if(e.repeat)return;
+  if(e.key==='+'||e.key==='='){ e.preventDefault(); zoomStep(1); }
+  else if(e.key==='-'||e.key==='_'){ e.preventDefault(); zoomStep(-1); }
+  else if(e.key.toLowerCase()==='c'){ $('#center').click(); }
+  else if(/^[1-4]$/.test(e.key)){ gotoPreset(+e.key); }
+  else if(e.shiftKey&&/^[!@#$]$/.test(e.key)){ savePreset('!@#$'.indexOf(e.key)+1); }
+});
+document.addEventListener('keyup',e=>{
+  const d=KEYDIR[e.key]; if(d){ held.delete(d); heldMove(); }});
+window.addEventListener('blur',()=>{ if(held.size){held.clear();heldMove();} });
+
+/* ---- state refresh + light polling (picks up changes from other apps) ---- */
+const deg=v=>v==null?'–':(v/3600).toFixed(1).replace(/\.0$/,'')+'°';
+function updateHUD(){
+  $('#t_pan').textContent=deg(ST.pan?.value);
+  $('#t_tilt').textContent=deg(ST.tilt?.value);
+  $('#t_zoom').textContent=ST.zoom?ST.zoom.value+'%':'–';
+}
+let lastSnap='';
 function refresh(){
   return api('/api/state').then(s=>{
-    ST=s.controls; PRE=s.presets||{};
     $('#dev').textContent=s.device; $('#dot').classList.add('ok');
+    const snap=JSON.stringify([s.controls,s.presets]);
+    ST=s.controls; PRE=s.presets||{};
+    if(!ptTimer){ TARGET.pan=ST.pan?.value; TARGET.tilt=ST.tilt?.value; }
+    updateHUD();
+    if(snap===lastSnap) return;         // nothing changed → don't rebuild the DOM
+    lastSnap=snap;
     if(ST.zoom){ const z=ST.zoom; const zi=$('#zoom');
       zi.min=z.min; zi.max=z.max; zi.step=z.step||1; zi.value=z.value; $('#zoom_v').textContent=z.value; fill(zi); }
-    renderGroup('#focusexp',['focus_auto','focus','auto_exposure','exposure']);
-    renderGroup('#image',['wb_auto','wb_temp','brightness','contrast','saturation','hue','gain','sharpness','backlight']);
+    renderGroup('focusexp',GROUPS.focusexp);
+    renderGroup('image',GROUPS.image);
     renderPresets();
   }).catch(e=>{
     $('#dot').classList.remove('ok');
     $('#dev').textContent='cannot reach server';
   });
 }
+setInterval(()=>{ if(!dragging&&!typing()&&!held.size&&!document.hidden) refresh(); },2500);
 refresh();
 startPreview();   // best-effort live preview on load
 </script>
