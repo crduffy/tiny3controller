@@ -24,9 +24,11 @@ pan/tilt/zoom HUD is shown at the top of the page.
 - **Presets** — `save` stores the current pan/tilt/zoom/focus; click the big
   button to recall; `rename` gives a slot a label.
 - **AI Tracking & Lens** — AI tracking modes (Off / Human / Upper body /
-  Close-up / Headless / Lower body / Group), field of view (86°/78°/65°), HDR
-  and face-priority exposure, all via the vendor XU (see below). While AI
-  tracking is on, the camera steers itself, so the manual pad is disabled.
+  Close-up / Headless / Lower body / Group), field of view (86°/78°/65°), HDR,
+  face-priority exposure, gesture control (hand gestures for target
+  selection/zoom/etc.) and voice control (the "Hi Tiny" commands), all via the
+  vendor XU (see below). While AI tracking is on, the camera steers itself, so
+  the manual pad is disabled.
 - The page polls the camera every 2.5 s, so changes made by other apps show up.
 
 ### Live preview
@@ -56,17 +58,30 @@ family (`cgevans/tiny2`, `mitchelloharawild/obsbot-tiny-2-control`,
   close-up / headless / lower-body / group; status bytes 0x18/0x1C), FOV
   (`reg 0x04`: 0 wide 86° / 1 medium 78° / 2 narrow 65° — the SDK enum mapping,
   which settles the conflicting mappings floating around the Tiny 2 projects),
-  HDR (`reg 0x01`, status byte 0x06) and face-AE (`reg 0x03`, status byte 0x07).
+  HDR (`reg 0x01`, status byte 0x06), face-AE (`reg 0x03`, status byte 0x07)
+  and **voice control** (`reg 0x15`: `[0x15, 2, cmd, 0|1]` per "Hi Tiny"
+  command; status byte 0x15 is the enabled-commands bitfield — found by
+  disassembling `cameraSetAudioCtrlStateU` in the official SDK's `libdev.so`).
+  The status block turned out to be the SDK's `CameraStatus` "tiny" struct
+  (`dev.hpp`), which decodes every byte.
+- **Gesture control** uses the framed command packets on selector 2. The
+  framing (header/body CRC16 included) was published by `jcdoll/obsBotRemote`
+  (validated there on a Tiny 3) and is implemented in `tiny3_xu.py`:
+  boolean gesture parameters are written with wire command `0x04/0x00D1` and
+  read back via `0x04/0x00D2` request/response. Verified here: enable/disable
+  all hand gestures with real state readback.
 - **Same grammar, not yet verified here:** the hand/whiteboard/desk AI modes
   (CLI-only for now).
-- **Capture/replay only** (framed `AA 25` packets with a checksum on
-  selector 2): sleep/wake, camera-side presets. Gesture toggles and tracking
-  speed need a usbmon capture of the official app to learn their register ids.
+- **Capture/replay only** (framed packets whose semantics are still unmapped):
+  sleep/wake, camera-side presets, tracking speed.
 
 ```bash
 python3 tiny3_xu.py status          # decode + dump the vendor status block
 python3 tiny3_xu.py ai normal       # AI tracking: off|normal|upper|closeup|…
 python3 tiny3_xu.py fov narrow      # wide|medium|narrow
+python3 tiny3_xu.py gesture off     # hand-gesture recognition on|off
+python3 tiny3_xu.py gesture-status  # per-gesture enable state
+python3 tiny3_xu.py voice off       # "Hi Tiny" voice commands on|off
 python3 tiny3_xu.py raw 16 02 02 00 # raw selector-6 register write
 ```
 
