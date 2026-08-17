@@ -79,7 +79,7 @@ PRESETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny3_p
 
 # AI tracking modes exposed in the web UI (verified on hardware; the
 # hand/whiteboard/desk modes stay CLI-only until confirmed on a Tiny 3).
-UI_AI_MODES = ["off", "normal", "upper", "closeup", "headless", "lower", "group"]
+UI_AI_MODES = ["off", "normal", "upper", "closeup", "headshot", "lower", "group"]
 
 
 class InactiveControl(Exception):
@@ -1071,7 +1071,7 @@ $('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value+'%';
 
 /* ---- AI tracking & lens (vendor XU) ---- */
 const AI_LABELS={off:'Off',normal:'Human',upper:'Upper body',closeup:'Close-up',
-                 headless:'Headless',lower:'Lower body',group:'Group'};
+                 headshot:'Head shot',lower:'Lower body',group:'Group'};
 const FOV_LABELS={wide:'Wide 86°',medium:'Med 78°',narrow:'Narrow 65°'};
 function xuSet(feature,value){
   XU[feature]=value; renderXU();       // optimistic — the poll confirms

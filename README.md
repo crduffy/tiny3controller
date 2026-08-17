@@ -25,7 +25,7 @@ pan/tilt/zoom HUD is shown at the top of the page.
 - **Presets** — `save` stores the current pan/tilt/zoom/focus; click the big
   button to recall; `rename` gives a slot a label.
 - **AI Tracking & Lens** — AI tracking modes (Off / Human / Upper body /
-  Close-up / Headless / Lower body / Group), field of view (86°/78°/65°), HDR,
+  Close-up / Head shot / Lower body / Group), field of view (86°/78°/65°), HDR,
   face-priority exposure, gesture control (hand gestures for target
   selection/zoom/etc.) and voice control (the "Hi Tiny" commands), all via the
   vendor XU (see below). While AI tracking is on the camera steers itself, so
@@ -65,7 +65,7 @@ family (`cgevans/tiny2`, `mitchelloharawild/obsbot-tiny-2-control`,
   `SET_CUR [reg, nbytes, values…]`; `GET_CUR` returns a status block
   (byte `0x18` = AI mode, byte `0x04` tracks FOV).
 - **Verified working:** AI tracking (`reg 0x16`: off / normal / upper-body /
-  close-up / headless / lower-body / group; status bytes 0x18/0x1C), FOV
+  close-up / head-shot / lower-body / group; status bytes 0x18/0x1C), FOV
   (`reg 0x04`: 0 wide 86° / 1 medium 78° / 2 narrow 65° — the SDK enum mapping,
   which settles the conflicting mappings floating around the Tiny 2 projects),
   HDR (`reg 0x01`, status byte 0x06), face-AE (`reg 0x03`, status byte 0x07)
