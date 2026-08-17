@@ -25,16 +25,20 @@ github.com/samliddicott/meet4k) and verified on real Tiny 3 hardware 2026-07-02:
 
 Verified working on the Tiny 3 (status read-back and/or visible effect):
     FOV      reg 0x04: 0=wide(86°) 1=medium(78°) 2=narrow(65°)  ← SDK mapping
-    AI mode  reg 0x16: [0x16, 2, major, minor]; disable + normal tracking tested,
-             status byte 0x18 reflects the major mode.
+    AI mode  reg 0x16: [0x16, 2, major, minor]; status byte 0x18 reflects the
+             major mode and 0x1C the sub-mode. The sub-modes are numbered from
+             1 (see AI_MODES) and were confirmed against the camera's actual
+             framing on 2026-08-16 -- the firmware echoes any value it is
+             given, so a status read-back cannot validate this mapping.
     HDR      reg 0x01: [0x01, 1, 0|1]; status byte 0x06 follows.
     Face-AE  reg 0x03: [0x03, 1, 0|1]; status byte 0x07 follows (default on).
     Voice ctrl reg 0x15: [0x15, 2, cmd, 0|1] per voice command (Hi Tiny, Sleep
              Tiny, Track Me, Unlock Me, Zoom In, Zoom Out, Preset). Extracted
              from the official SDK's cameraSetAudioCtrlStateU in libdev.so.
-             Status byte 0x15 is the enabled-commands bitfield: bit0 HiTiny,
-             bit1 Sleep, bit2 ZoomIn, bit3 ZoomOut, bit4 Track, bit5 Unlock,
-             bit6 Preset (byte 0x14 = language, 0=zh 1=en).
+             Status byte 0x15 is the enabled-commands bitfield, per the
+             vendor's REMO_VOICE_*_BIT defines: bit0 HiTiny, bit1 Preset,
+             bit2 ZoomIn, bit3 ZoomOut, bit4 Track, bit5 Unlock, bit6 Sleep
+             (byte 0x14 = language, 0=zh 1=en).
     Gesture control: framed selector-2 SDK commands (see GESTURE_* below);
              set 0x03 id 0x007C writes a boolean gesture parameter
              (0=master, 1=target-select, 2=zoom, 3=dynamic-zoom, 4=record,
@@ -47,7 +51,7 @@ pack(1)): 6=hdr 7=face_ae 0x11=fov-enum 0x14=voice-lang 0x15=voice-bitfield
 
 Usage as CLI:
     python3 tiny3_xu.py status                 # decode + hex-dump selector 6
-    python3 tiny3_xu.py ai off|normal|upper|closeup|headless|lower|group
+    python3 tiny3_xu.py ai off|normal|upper|closeup|headshot|lower|group
     python3 tiny3_xu.py fov wide|medium|narrow
     python3 tiny3_xu.py hdr on|off
     python3 tiny3_xu.py face-ae on|off
@@ -73,30 +77,57 @@ XU_UNIT = 2                             # vendor XU on the Tiny 3 (same as Tiny 
 SEL_CONFIG = 6                          # register-RPC selector
 SEL_COMMAND = 2                         # framed V3 command selector
 
+# Register 0x16 takes (major, minor). The minor is the vendor's
+# RemoAITrackMode_e, which starts at DISABLE=0 and so numbers the portrait
+# sub-modes from 1 -- NOT from 0:
+#     0 DISABLE  1 ROUTINE  2 UPPER_PART_BODY
+#     3 SHOT (close-up)     4 STRIPPER_HEAD (head shot) 5 LOWER_PART_BODY
+# We previously numbered them from 0, which shifted every sub-mode down one:
+# picking "close-up" gave upper-body framing, "head shot" gave close-up, and so
+# on. The firmware accepts and echoes ANY minor byte without validating it, so
+# a status read-back confirms whatever was sent and cannot catch the error --
+# it only shows up in how the camera actually frames you.
 AI_MODES = {                            # -> (major, minor) for register 0x16
     "off":       (0, 0),
-    "normal":    (2, 0),
-    "upper":     (2, 1),
-    "closeup":   (2, 2),
-    "headless":  (2, 3),
-    "lower":     (2, 4),
+    "normal":    (2, 1),   # ROUTINE
+    "upper":     (2, 2),   # UPPER_PART_BODY
+    "closeup":   (2, 3),   # SHOT
+    # STRIPPER_HEAD reads either way in English, and the Tiny 2 projects took
+    # it as "strip off the head" -> "headless". On hardware it frames a head
+    # shot, i.e. strip down TO the head, so it is named for what it does.
+    "headshot":  (2, 4),   # STRIPPER_HEAD
+    "lower":     (2, 5),   # LOWER_PART_BODY
     "group":     (1, 0),
-    "hand":      (3, 0),   # unverified on Tiny 3
-    "whiteboard":(4, 0),   # unverified on Tiny 3
-    "desk":      (5, 0),   # unverified on Tiny 3
+    # Unverified on the Tiny 3. Note the vendor's RemoAIMode_e reads
+    # DESKTOP=3, WHITEBOARD=4, HANDSTRACK=5, which would make "hand" and
+    # "desk" below the wrong way round -- but that same enum calls 2
+    # ANIMAL_TRACK while 2 is demonstrably portrait tracking here, so the
+    # major byte does not follow it and these are left as found.
+    "hand":      (3, 0),
+    "whiteboard":(4, 0),
+    "desk":      (5, 0),
 }
 FOV_MODES = {"wide": 0, "medium": 1, "narrow": 2}
 
 # Voice-command ids for register 0x15 (SDK AudioCtrlCmdType) and where each
-# lands in the status-byte-0x15 bitfield (dev.hpp comment; enum order differs).
+# lands in the status-byte-0x15 bitfield.
+#
+# The bit positions are the vendor's REMO_VOICE_*_BIT defines:
+#     0 HI_TINY  1 PRESET  2 ZOOM_IN  3 ZOOM_OUT
+#     4 TRACE    5 UNTRACE 6 SLEEP
+# "sleep" and "preset" were previously mapped to each other's bits. Only the
+# per-command read-back was affected -- the UI enables or disables the whole
+# set (0x7f), so the swap never showed there, and the camera echoes the byte
+# it was given either way. The cmd ids in the first slot are a separate SDK
+# enum that this header does not define, so they remain unverified.
 VOICE_CMDS = {  # name -> (cmd id, status bit)
     "hi_tiny":  (0, 0),
-    "sleep":    (1, 1),
+    "sleep":    (1, 6),
     "track":    (2, 4),
     "unlock":   (3, 5),
     "zoom_in":  (4, 2),
     "zoom_out": (5, 3),
-    "preset":   (6, 6),
+    "preset":   (6, 1),
 }
 
 # Gesture-control wire commands for selector 2 (SDK cmd -> V3 wire cmd, from
@@ -290,7 +321,12 @@ class Tiny3XU:
         major, minor = s[0x18], s[0x1C]
         return {
             "fov_raw": s[0x04],
-            "fov": fov.get(s[0x04], "wide"),
+            # Do not fall back to "wide": byte 0x04 passes through intermediate
+            # values while the lens is changing (0x0a has been observed between
+            # settled states), and defaulting would report a confident, wrong
+            # answer. An unrecognised value is reported as unknown so the UI
+            # highlights nothing rather than the wrong button.
+            "fov": fov.get(s[0x04], f"unknown(0x{s[0x04]:02x})"),
             "hdr": bool(s[0x06]),
             "face_ae": bool(s[0x07]),
             "ai_major": major,

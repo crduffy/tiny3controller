@@ -12,6 +12,7 @@ Then open http://localhost:8080  (or http://<this-pc-ip>:8080 from your phone).
 """
 
 import argparse
+import errno
 import fcntl
 import glob
 import json
@@ -50,8 +51,11 @@ CONTROLS = [
     (0x009A0908, "pan",        "Pan",            "ptz"),
     (0x009A0909, "tilt",       "Tilt",           "ptz"),
     (0x009A090D, "zoom",       "Zoom",           "ptz"),
-    (0x009A0920, "pan_speed",  "Pan speed",      "ptz"),
-    (0x009A0921, "tilt_speed", "Tilt speed",     "ptz"),
+    # pan_speed (0x009A0920) and tilt_speed (0x009A0921) are deliberately NOT
+    # exposed. Writing them physically moves the gimbal while the firmware
+    # leaves the reported pan/tilt untouched, so the coordinate frame silently
+    # desyncs and only a USB reset recovers it. Leaving them out of CONTROLS
+    # keeps them unreachable through /api/set as well. Use absolute targets.
     (0x009A090A, "focus",      "Focus",          "focus"),
     (0x009A090C, "focus_auto", "Auto focus",     "focus"),
     (0x009A0901, "auto_exposure", "Exposure mode", "exposure"),
@@ -75,7 +79,15 @@ PRESETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny3_p
 
 # AI tracking modes exposed in the web UI (verified on hardware; the
 # hand/whiteboard/desk modes stay CLI-only until confirmed on a Tiny 3).
-UI_AI_MODES = ["off", "normal", "upper", "closeup", "headless", "lower", "group"]
+UI_AI_MODES = ["off", "normal", "upper", "closeup", "headshot", "lower", "group"]
+
+
+class InactiveControl(Exception):
+    """A control whose auto mode currently owns it refused the write."""
+
+
+class PresetStoreError(Exception):
+    """The presets file could not be written."""
 
 
 class Camera:
@@ -86,7 +98,8 @@ class Camera:
         self._lock = threading.Lock()
         self.xu = Tiny3XU(self.fd)
         # Gesture state lives behind a request/response RPC that occasionally
-        # doesn't answer; remember the last good reading for those polls.
+        # doesn't answer. Kept only as the last reading for debugging -- it is
+        # never served to clients in place of a fresh one (see xu_status).
         self._gesture = None
 
     def xu_status(self):
@@ -97,11 +110,14 @@ class Camera:
                 gesture = self.xu.get_gesture_param("master", retries=5)
         except OSError:
             return None
-        if gesture is not None:
-            self._gesture = gesture
+        # Report the gesture bit we actually read back. Selector 2 occasionally
+        # does not answer, and a stale cached value is indistinguishable from a
+        # real "off" -- so an unconfirmed read is reported as null and the UI
+        # shows it as unknown rather than inventing a state.
+        self._gesture = gesture
         return {"ai": st["ai_mode"], "fov": st["fov"],
                 "hdr": st["hdr"], "face_ae": st["face_ae"],
-                "voice": st["voice"], "gesture": self._gesture,
+                "voice": st["voice"], "gesture": gesture,
                 "ai_modes": UI_AI_MODES, "fov_modes": list(FOV_MODES)}
 
     def xu_set(self, feature, value):
@@ -176,9 +192,29 @@ class Camera:
         return val
 
     def set(self, cid, value):
-        buf = bytearray(struct.pack(_CTRL_FMT, cid, int(value)))
-        with self._lock:
-            fcntl.ioctl(self.fd, VIDIOC_S_CTRL, buf, True)
+        # Clamp to the control's advertised range before writing. The driver
+        # clamps most controls itself, but not all of them treat the value as
+        # signed: zoom_absolute reads a negative as a large unsigned number and
+        # saturates at *maximum*, so an out-of-range write lands at the opposite
+        # end from what the caller meant. Clamping here makes every control
+        # behave the same way. Step alignment is left to the driver, which
+        # rounds correctly.
+        # Reject non-numbers explicitly. bool is a subclass of int, so `true`
+        # would otherwise be accepted silently as 1.
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError("value must be a number")
+        value = int(value)
+        q = self.query(cid)
+        if q:
+            value = max(q["min"], min(q["max"], value))
+        buf = bytearray(struct.pack(_CTRL_FMT, cid, value))
+        try:
+            with self._lock:
+                fcntl.ioctl(self.fd, VIDIOC_S_CTRL, buf, True)
+        except OSError as e:
+            if e.errno == errno.EACCES:
+                raise InactiveControl(cid) from e
+            raise
         return self.get(cid)
 
     def snapshot(self):
@@ -222,8 +258,15 @@ def load_presets():
     return out
 
 def save_presets(p):
-    with open(PRESETS_FILE, "w") as f:
-        json.dump(p, f, indent=2)
+    # Wrap disk failures in their own type. A read-only presets file raises
+    # PermissionError, which is an OSError with errno EACCES -- exactly what the
+    # driver raises for an inactive control -- so without this the handler would
+    # answer a disk problem with "control is inactive".
+    try:
+        with open(PRESETS_FILE, "w") as f:
+            json.dump(p, f, indent=2)
+    except OSError as e:
+        raise PresetStoreError(e.strerror or str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -275,30 +318,57 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if not length:
             return {}
-        try:
-            return json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
+        raw = self.rfile.read(length)
+        if not raw.strip():
             return {}
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            # Say the body was unparseable rather than letting it fall through
+            # as an empty dict, which used to surface as "unknown control None".
+            raise ValueError("request body is not valid JSON")
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+        return body
 
     def do_GET(self):
+        # Wrapped like do_POST: a short/garbled XU status buffer surfaces as an
+        # IndexError out of decode_status, and an unhandled one here drops the
+        # connection so the UI just reports "cannot reach server".
         if self.path == "/" or self.path.startswith("/index"):
+            # Served outside the try: once the headers are out, a failed write
+            # means the client vanished, and answering again would be a second
+            # response on a committed socket.
             body = INDEX_HTML.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/api/state":
-            self._json({"controls": self.cam.snapshot(),
-                        "presets": load_presets(),
-                        "xu": self.cam.xu_status(),
-                        "device": self.cam.device})
-        else:
-            self._json({"error": "not found"}, 404)
+            return
+        if self.path != "/api/state":
+            return self._json({"error": "not found"}, 404)
+        # Only the state payload can raise: a short or garbled XU status buffer
+        # surfaces as an IndexError out of decode_status, and an unhandled one
+        # drops the connection so the UI just reports "cannot reach server".
+        try:
+            payload = {"controls": self.cam.snapshot(),
+                       "presets": load_presets(),
+                       "xu": self.cam.xu_status(),
+                       "device": self.cam.device}
+        except OSError as e:
+            return self._json(
+                {"error": f"camera I/O error: {e.strerror or e}"}, 500)
+        except Exception as e:
+            return self._json(
+                {"error": f"internal error: {type(e).__name__}"}, 500)
+        self._json(payload)
 
     def do_POST(self):
-        data = self._read_body()
         try:
+            # inside the try: an unparseable body must come back as a 400, not
+            # escape the handler and drop the connection with no response
+            data = self._read_body()
             if self.path == "/api/set":
                 key = data.get("key")
                 cid = ID_BY_KEY.get(key)
@@ -307,14 +377,11 @@ class Handler(BaseHTTPRequestHandler):
                 val = self.cam.set(cid, data["value"])
                 return self._json({"key": key, "value": val})
 
-            if self.path == "/api/move":
-                # continuous pan/tilt via speed; 0 stops
-                ps, ts = int(data.get("pan_speed", 0)), int(data.get("tilt_speed", 0))
-                if "pan_speed" in ID_BY_KEY:
-                    self.cam.set(ID_BY_KEY["pan_speed"], ps)
-                if "tilt_speed" in ID_BY_KEY:
-                    self.cam.set(ID_BY_KEY["tilt_speed"], ts)
-                return self._json({"pan_speed": ps, "tilt_speed": ts})
+            # NOTE: there is deliberately no speed-based move endpoint. Writing
+            # pan_speed/tilt_speed physically moves the gimbal but the firmware
+            # never updates the reported pan/tilt, so the coordinate frame
+            # silently desyncs and only a USB reset recovers it. The UI steps
+            # absolute pan/tilt targets instead (see ptzTick in the page script).
 
             if self.path == "/api/center":
                 for k in ("pan", "tilt"):
@@ -362,15 +429,53 @@ class Handler(BaseHTTPRequestHandler):
                     if k == "focus" and focus_auto_on:
                         continue
                     try:
-                        self.cam.set(ID_BY_KEY[k], v)
-                        applied[k] = v
-                    except OSError as e:
+                        # report what the camera actually took, not what was
+                        # asked for -- the driver clamps and step-rounds
+                        applied[k] = self.cam.set(ID_BY_KEY[k], v)
+                    except InactiveControl:
+                        errors[k] = "inactive (its auto mode is on)"
+                    except (OSError, ValueError, TypeError,
+                            struct.error) as e:
+                        # a hand-edited or legacy presets file can hold junk;
+                        # record it and keep restoring the rest, as promised
                         errors[k] = str(e)
                 return self._json({"slot": slot, "applied": applied, "errors": errors})
 
             return self._json({"error": "not found"}, 404)
-        except (OSError, KeyError, ValueError) as e:
-            return self._json({"error": str(e)}, 500)
+        except InactiveControl:
+            # the driver refuses writes to a control its auto mode owns. Raised
+            # only from Camera.set, so a disk EACCES can never land here.
+            return self._json({"error": "control is inactive "
+                                        "(its auto mode is on)"}, 400)
+        except KeyError as e:
+            # a required field was missing from the request body
+            field = e.args[0] if e.args else "?"
+            return self._json({"error": f"missing field {field!r}"}, 400)
+        except (ValueError, TypeError, OverflowError, RecursionError,
+                struct.error) as e:
+            # bad value from the client: unknown mode, non-numeric value, a JSON
+            # null/array where a number belongs, an int too large to pack,
+            # pathologically nested JSON, ...
+            msg = str(e)
+            if not isinstance(e, ValueError) or "invalid literal" in msg \
+                    or "could not convert" in msg:
+                msg = "value must be a number"
+            if isinstance(e, RecursionError):
+                msg = "request body is nested too deeply"
+            return self._json({"error": msg}, 400)
+        except PresetStoreError as e:
+            # writing tiny3_presets.json failed -- a disk problem, not a camera
+            # one, and emphatically not an inactive control
+            return self._json({"error": f"could not save presets: {e}"}, 500)
+        except OSError as e:
+            return self._json(
+                {"error": f"camera I/O error: {e.strerror or e}"}, 500)
+        except Exception as e:
+            # last resort: a malformed status buffer surfaces as IndexError, and
+            # anything unforeseen must still get a response rather than dropping
+            # the connection with a traceback.
+            return self._json(
+                {"error": f"internal error: {type(e).__name__}"}, 500)
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -378,9 +483,9 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>OBSBOT Tiny 3 · Control Deck</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Sora:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- No webfont link on purpose: this panel runs on localhost next to the
+     camera and must not stall waiting on a font CDN when the machine is
+     offline. The stacks below fall back through the platform's own faces. -->
 <style>
   :root{
     --bg:#080a0e;
@@ -390,9 +495,9 @@ INDEX_HTML = r"""<!doctype html>
     --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.12);
     --surface:linear-gradient(168deg,#161b23 0%,#10141b 60%,#0d1118 100%);
     --shadow:0 18px 40px -22px rgba(0,0,0,.85);
-    --mono:"Chakra Petch",ui-monospace,monospace;
-    --disp:"Chakra Petch",system-ui,sans-serif;
-    --body:"Sora",system-ui,-apple-system,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --disp:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --body:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   }
   *{box-sizing:border-box}
   html{-webkit-text-size-adjust:100%}
@@ -512,7 +617,8 @@ INDEX_HTML = r"""<!doctype html>
   button{font-family:var(--body);background:rgba(255,255,255,.045);color:var(--fg);
     border:1px solid var(--line2);border-radius:12px;padding:12px;font-size:14px;cursor:pointer;
     touch-action:manipulation;transition:transform .08s,background .15s,border-color .15s,box-shadow .15s}
-  button:hover{border-color:rgba(47,224,192,.4);background:rgba(47,224,192,.06)}
+  button:hover:not(:disabled){border-color:rgba(47,224,192,.4);background:rgba(47,224,192,.06)}
+  button:disabled{cursor:not-allowed}
   button:active{transform:scale(.95)}
   .pvtoggle{font-family:var(--mono);letter-spacing:.12em;text-transform:uppercase;font-size:12px;
     padding:10px 16px;color:var(--acc);border-color:rgba(47,224,192,.35);background:var(--acc-soft)}
@@ -526,7 +632,8 @@ INDEX_HTML = r"""<!doctype html>
   .pad button{display:flex;align-items:center;justify-content:center;font-size:19px;border-radius:16px;
     color:var(--acc);background:rgba(255,255,255,.04)}
   .pad button.diag{font-size:13px;color:var(--mut);border-radius:14px}
-  .pad button[data-dir]:active,.pad button[data-dir].held{background:var(--acc);color:#04130f;
+  .pad button[data-dir]:active:not(:disabled),
+  .pad button[data-dir].held:not(:disabled){background:var(--acc);color:#04130f;
     border-color:var(--acc);box-shadow:0 0 22px -4px var(--acc)}
   #center{border-radius:50%;font-size:18px;color:var(--mut);font-family:var(--mono)}
   #center:hover{color:var(--acc)}
@@ -585,6 +692,15 @@ INDEX_HTML = r"""<!doctype html>
     color:var(--acc);background:var(--acc-soft);border:1px dashed rgba(47,224,192,.35)}
   .ai-live .ainote{display:block}
   .ai-live .padwrap,.ai-live .speedrow{opacity:.35;pointer-events:none}
+  /* ⌂ keeps taking clicks while tracking so it can explain the lockout rather
+     than sitting there inert; the direction buttons stay fully blocked. */
+  .ai-live .padwrap #center{pointer-events:auto;cursor:pointer}
+  /* the buttons also carry a real disabled attribute while tracking steers */
+  .pad button:disabled,#speedseg button:disabled{cursor:not-allowed}
+  /* an XU toggle whose readback was not confirmed shows as unknown, not off */
+  .toggle-row.unknown label::after{content:' · unknown';color:var(--warn);
+    font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase}
+  .toggle-row.unknown .toggle{opacity:.55}
 
   /* ---------- presets ---------- */
   .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}
@@ -597,6 +713,9 @@ INDEX_HTML = r"""<!doctype html>
   .presets .pname{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;
     color:var(--mut2);border:none;background:none;padding:2px 0;cursor:text}
   .presets .pname:hover{color:var(--acc)}
+  /* an empty slot's label is a span, not a button — no hover affordance */
+  .presets .pname-empty{cursor:default;display:block;text-align:center}
+  .presets .pname-empty:hover{color:var(--mut2)}
   .presets input.pname{color:var(--fg);background:rgba(0,0,0,.4);border:1px solid var(--acc-deep);
     border-radius:6px;text-align:center;outline:none;text-transform:none;letter-spacing:.05em;font-size:11px;width:100%}
   @media(max-width:380px){.presets{grid-template-columns:repeat(2,1fr)}}
@@ -651,15 +770,15 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Pan · Tilt · Zoom</h2>
       <div class="padwrap">
         <div class="pad">
-          <button data-dir="ul" class="diag">◤</button>
-          <button data-dir="up">▲</button>
-          <button data-dir="ur" class="diag">◥</button>
-          <button data-dir="left">◄</button>
-          <button id="center" title="Re-center pan/tilt">⌂</button>
-          <button data-dir="right">►</button>
-          <button data-dir="dl" class="diag">◣</button>
-          <button data-dir="down">▼</button>
-          <button data-dir="dr" class="diag">◢</button>
+          <button data-dir="ul" class="diag" aria-label="Pan left and tilt up">◤</button>
+          <button data-dir="up" aria-label="Tilt up">▲</button>
+          <button data-dir="ur" class="diag" aria-label="Pan right and tilt up">◥</button>
+          <button data-dir="left" aria-label="Pan left">◄</button>
+          <button id="center" title="Re-center pan/tilt" aria-label="Re-center pan and tilt">⌂</button>
+          <button data-dir="right" aria-label="Pan right">►</button>
+          <button data-dir="dl" class="diag" aria-label="Pan left and tilt down">◣</button>
+          <button data-dir="down" aria-label="Tilt down">▼</button>
+          <button data-dir="dr" class="diag" aria-label="Pan right and tilt down">◢</button>
         </div>
       </div>
       <div class="speedrow">
@@ -672,9 +791,9 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="zoomrow">
         <span class="zlab">Zoom</span>
-        <button data-zoom="-1" title="Hold to zoom out">−</button>
+        <button data-zoom="-1" title="Hold to zoom out" aria-label="Zoom out">−</button>
         <input type="range" id="zoom"><span class="val" id="zoom_v">–</span>
-        <button data-zoom="1" title="Hold to zoom in">+</button>
+        <button data-zoom="1" title="Hold to zoom in" aria-label="Zoom in">+</button>
       </div>
       <div class="kbd">
         <b>←↑↓→</b> move · <b>+</b><b>−</b> zoom · <b>C</b> center · <b>1</b>–<b>4</b> preset · <b>⇧1</b>–<b>4</b> save
@@ -785,6 +904,13 @@ const DIRS={up:[0,1],down:[0,-1],left:[-1,0],right:[1,0],
 let ptTimer=null, ptDir=[0,0];
 const TARGET={pan:null,tilt:null};      // last position we commanded
 function ptzTick(){
+  // Tracking can be switched on from the remote or the OBSBOT app mid-hold; the
+  // guard in move() only runs at pointerdown, so re-check every tick or this
+  // timer keeps writing absolute targets and fights the tracker forever.
+  // Caveat: this can only see state the poll has fetched, and the poll is
+  // suppressed while an arrow key is held (held.size), so during a *keyboard*
+  // hold the news arrives on key release, when move() re-guards anyway.
+  if(aiActive()){ move(0,0); return; }
   const stepsPerTick=speedFrac===1?7:speedFrac===.6?3:1;
   [['pan',ptDir[0]],['tilt',ptDir[1]]].forEach(([k,d])=>{
     if(!d)return; const c=ST[k]; if(!c)return;
@@ -809,8 +935,28 @@ document.querySelectorAll('.pad button[data-dir]').forEach(b=>{
   b.addEventListener('pointerup',stop);
   b.addEventListener('pointerleave',stop);
   b.addEventListener('pointercancel',stop);
+  // These buttons are named for assistive tech, so they must also work from the
+  // keyboard: hold Enter/Space to move, release to stop, mirroring the pointer.
+  b.addEventListener('keydown',e=>{
+    if(e.key!=='Enter'&&e.key!==' ')return;
+    e.preventDefault(); if(!e.repeat) move(px,ty); });
+  b.addEventListener('keyup',e=>{
+    if(e.key!=='Enter'&&e.key!==' ')return;
+    e.preventDefault(); move(0,0); });
+  b.addEventListener('blur',()=>{ if(ptTimer) move(0,0); });
 });
-$('#center').onclick=()=>api('/api/center',{}).then(refresh).catch(oops);
+// A pointerup anywhere ends a hold: releasing off the button (or over a element
+// that swallowed the event) would otherwise strand the repeat timer.
+document.addEventListener('pointerup',()=>{ if(ptTimer) move(0,0); });
+window.addEventListener('blur',()=>{ if(ptTimer) move(0,0); });
+// Shared by the ⌂ button and the C key. Routing the key through this function
+// rather than $('#center').click() keeps the two paths independent of whether
+// the button happens to be disabled, focusable or hit-testable at the time —
+// the guard lives in one place and both callers get the same notice.
+function recenter(){
+  if(aiActive()) return toast('AI tracking is steering — set it to Off first','err');
+  api('/api/center',{}).then(refresh).catch(oops); }
+$('#center').onclick=recenter;
 
 function setKey(key,value){ return api('/api/set',{key,value}).catch(oops); }
 
@@ -853,6 +999,7 @@ function toggleRow(c){
   const wrap=document.createElement('div'); wrap.className='row toggle-row';
   const lab=document.createElement('label'); lab.textContent=c.label;
   const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!!c.value;
+  cb.setAttribute('aria-label',c.label);
   cb.onchange=()=>setKey(c.key,cb.checked?1:0).then(refresh);
   const t=document.createElement('div'); t.className='toggle'; t.append(cb);
   wrap.append(lab,t); return wrap;
@@ -892,45 +1039,78 @@ document.querySelectorAll('[data-reset]').forEach(b=>{
 function zoomStep(dir){ const c=ST.zoom; if(!c)return;
   const zi=$('#zoom');
   let v=Math.max(c.min,Math.min(c.max,(+zi.value)+dir*(c.step*4||4)));
-  zi.value=v; $('#zoom_v').textContent=v; $('#t_zoom').textContent=v+'%'; fill(zi); setKey('zoom',v); }
+  zi.value=v; $('#zoom_v').textContent=v+'%'; $('#t_zoom').textContent=v+'%'; fill(zi); setKey('zoom',v); }
 document.querySelectorAll('[data-zoom]').forEach(b=>{
   const dir=+b.dataset.zoom; let rep=null;
-  const start=e=>{e.preventDefault(); zoomStep(dir); rep=setInterval(()=>zoomStep(dir),160);};
-  const stop =()=>{clearInterval(rep); rep=null;};
+  // Guard re-entry the way move() guards ptTimer. Without it a second
+  // activation while the first is still held (mouse-down then Enter, or
+  // Enter+Space together) overwrites `rep`, orphaning the first interval —
+  // which nothing can then clear, and zoom runs away to its limit on its own.
+  const start=e=>{e.preventDefault(); if(rep)return;
+    zoomStep(dir); rep=setInterval(()=>zoomStep(dir),160);};
+  const stop =()=>{if(rep)clearInterval(rep); rep=null;};
   b.addEventListener('pointerdown',start);
   b.addEventListener('pointerup',stop);
   b.addEventListener('pointerleave',stop);
   b.addEventListener('pointercancel',stop);
+  // keyboard equivalents, and a global release so a repeat can never strand
+  b.addEventListener('keydown',e=>{
+    if(e.key!=='Enter'&&e.key!==' ')return;
+    e.preventDefault(); if(!e.repeat) start(e); });
+  b.addEventListener('keyup',e=>{
+    if(e.key!=='Enter'&&e.key!==' ')return;
+    e.preventDefault(); stop(); });
+  b.addEventListener('blur',stop);
+  document.addEventListener('pointerup',stop);
+  window.addEventListener('blur',stop);
 });
 $('#zoom').addEventListener('pointerdown',()=>dragging=true);
-$('#zoom').onchange=()=>{ $('#zoom_v').textContent=$('#zoom').value; setKey('zoom',+$('#zoom').value); };
-$('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value;
+$('#zoom').onchange=()=>{ $('#zoom_v').textContent=$('#zoom').value+'%'; setKey('zoom',+$('#zoom').value); };
+$('#zoom').oninput =()=>{ $('#zoom_v').textContent=$('#zoom').value+'%';
   $('#t_zoom').textContent=$('#zoom').value+'%'; fill($('#zoom')); };
 
 /* ---- AI tracking & lens (vendor XU) ---- */
 const AI_LABELS={off:'Off',normal:'Human',upper:'Upper body',closeup:'Close-up',
-                 headless:'Headless',lower:'Lower body',group:'Group'};
+                 headshot:'Head shot',lower:'Lower body',group:'Group'};
 const FOV_LABELS={wide:'Wide 86°',medium:'Med 78°',narrow:'Narrow 65°'};
 function xuSet(feature,value){
   XU[feature]=value; renderXU();       // optimistic — the poll confirms
   return api('/api/xu',{feature,value}).then(r=>{
-    if(r.xu){ if(String(r.xu[feature]).startsWith('unknown')) r.xu[feature]=value; XU=r.xu; }
+    // Show what the camera actually reports. Substituting the requested value
+    // over an unconfirmed readback would render a failed write as a success.
+    if(r.xu){ if(String(r.xu[feature]).startsWith('unknown')) r.xu[feature]=null; XU=r.xu; }
     renderXU(); setTimeout(refresh,1600);   // re-read once the mode change settles
   }).catch(e=>{oops(e);refresh();});
 }
 function xuToggleRow(label,feature){
   const wrap=document.createElement('div'); wrap.className='row toggle-row';
   const lab=document.createElement('label'); lab.textContent=label;
-  const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!!XU[feature];
+  const cb=document.createElement('input'); cb.type='checkbox';
+  cb.setAttribute('aria-label',label);
+  if(XU[feature]==null){        // readback did not confirm — show indeterminate
+    cb.indeterminate=true; cb.checked=false; wrap.classList.add('unknown');
+    cb.setAttribute('aria-label',label+' (state unknown)');
+  } else cb.checked=!!XU[feature];
   cb.onchange=()=>xuSet(feature,cb.checked);
   const t=document.createElement('div'); t.className='toggle'; t.append(cb);
   wrap.append(lab,t); return wrap;
 }
 function renderXU(){
   const card=$('#xucard');
-  if(!XU){ card.style.display='none'; $('#ptzcard').classList.remove('ai-live'); return; }
+  // Compute and apply the steering lockout BEFORE any early return: if the XU
+  // stops answering, XU goes null and the pad must be handed back, not left
+  // disabled with the dimming and the explanatory note both gone.
+  const steering=aiActive();
+  $('#ptzcard').classList.toggle('ai-live',!!steering);
+  // Stop an in-flight hold: once the buttons go un-hit-testable their pointerup
+  // may never arrive, which would strand the repeat timer and the .held class.
+  if(steering&&ptTimer) move(0,0);
+  // #center stays enabled so a click still reaches recenter() and explains
+  // itself; the direction and speed buttons are genuinely unavailable.
+  document.querySelectorAll('.pad button[data-dir],#speedseg button')
+    .forEach(b=>{ b.disabled=!!steering; });
+  if(!XU){ card.style.display='none'; return; }
   card.style.display='';
-  $('#ptzcard').classList.toggle('ai-live',aiActive());
   const grid=$('#aimodes'); grid.innerHTML='';
   (XU.ai_modes||[]).forEach(m=>{
     const b=document.createElement('button'); b.textContent=AI_LABELS[m]||m;
@@ -964,8 +1144,12 @@ function renderPresets(){
     const save=document.createElement('button'); save.className='save'; save.textContent='save';
     save.title='Save current pan/tilt/zoom/focus here (shift+'+i+')';
     save.onclick=()=>savePreset(i);
-    const name=document.createElement('button'); name.className='pname';
+    // An empty slot has nothing to rename, so render a plain label rather than
+    // a button that looks clickable and does nothing.
+    const name=document.createElement(p?'button':'span'); name.className='pname';
+    if(!p) name.classList.add('pname-empty');
     name.textContent=p?'rename':'empty';
+    if(p) name.title='Rename preset '+i;
     if(p) name.onclick=()=>{
       const box=document.createElement('input'); box.className='pname'; box.maxLength=24;
       box.value=p.name||''; box.placeholder='P'+i;
@@ -977,9 +1161,16 @@ function renderPresets(){
     slot.append(go,save,name); el.append(slot);
   }
 }
-function savePreset(i){ api('/api/preset/save',{slot:i})
+function savePreset(i){
+  // While tracking steers, the firmware moves the gimbal without updating the
+  // reported pan/tilt, so a snapshot taken now records stale coordinates and
+  // the preset would recall to the wrong place. Refuse rather than save junk.
+  if(aiActive()) return toast('AI tracking is steering — pan/tilt readings are '
+    +'stale, set tracking to Off before saving','err');
+  api('/api/preset/save',{slot:i})
   .then(()=>{toast('Preset '+i+' saved','okc');refresh();}).catch(oops); }
 function gotoPreset(i){ if(!PRE[String(i)]) return toast('Preset '+i+' is empty — shift+'+i+' to save','err');
+  if(aiActive()) return toast('AI tracking is steering — set it to Off first','err');
   api('/api/preset/go',{slot:i}).then(r=>{
     const errs=Object.keys(r.errors||{});
     if(errs.length) toast('Recalled with errors: '+errs.join(', '),'err');
@@ -1003,9 +1194,14 @@ document.addEventListener('keydown',e=>{
   if(e.repeat)return;
   if(e.key==='+'||e.key==='='){ e.preventDefault(); zoomStep(1); }
   else if(e.key==='-'||e.key==='_'){ e.preventDefault(); zoomStep(-1); }
-  else if(e.key.toLowerCase()==='c'){ $('#center').click(); }
-  else if(/^[1-4]$/.test(e.key)){ gotoPreset(+e.key); }
-  else if(e.shiftKey&&/^[!@#$]$/.test(e.key)){ savePreset('!@#$'.indexOf(e.key)+1); }
+  else if(e.key.toLowerCase()==='c'&&!e.ctrlKey&&!e.metaKey){ recenter(); }
+  // Match on e.code, not e.key: with shift held the character depends on the
+  // keyboard layout (!@#$ is US-only), but Digit1..Digit4 is layout-independent.
+  // Numpad1..4 is accepted too — e.key used to cover the keypad for free.
+  // Ctrl/Cmd are excluded so browser tab-switching shortcuts pass through.
+  else if(/^(Digit|Numpad)[1-4]$/.test(e.code)&&!e.ctrlKey&&!e.metaKey){
+    const n=+e.code.replace(/\D/g,'');
+    if(e.shiftKey) savePreset(n); else gotoPreset(n); }
 });
 document.addEventListener('keyup',e=>{
   const d=KEYDIR[e.key]; if(d){ held.delete(d); heldMove(); }});
@@ -1029,7 +1225,7 @@ function refresh(){
     if(snap===lastSnap) return;         // nothing changed → don't rebuild the DOM
     lastSnap=snap;
     if(ST.zoom){ const z=ST.zoom; const zi=$('#zoom');
-      zi.min=z.min; zi.max=z.max; zi.step=z.step||1; zi.value=z.value; $('#zoom_v').textContent=z.value; fill(zi); }
+      zi.min=z.min; zi.max=z.max; zi.step=z.step||1; zi.value=z.value; $('#zoom_v').textContent=z.value+'%'; fill(zi); }
     renderGroup('focusexp',GROUPS.focusexp);
     renderGroup('image',GROUPS.image);
     renderPresets();
