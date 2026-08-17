@@ -85,16 +85,23 @@ class Camera:
         # The fd is shared across request-handler threads; serialize all ioctls.
         self._lock = threading.Lock()
         self.xu = Tiny3XU(self.fd)
+        # Gesture state lives behind a request/response RPC that occasionally
+        # doesn't answer; remember the last good reading for those polls.
+        self._gesture = None
 
     def xu_status(self):
         """Vendor-feature state, or None if the XU doesn't answer."""
         try:
             with self._lock:
                 st = self.xu.decode_status()
+                gesture = self.xu.get_gesture_param("master", retries=5)
         except OSError:
             return None
+        if gesture is not None:
+            self._gesture = gesture
         return {"ai": st["ai_mode"], "fov": st["fov"],
                 "hdr": st["hdr"], "face_ae": st["face_ae"],
+                "voice": st["voice"], "gesture": self._gesture,
                 "ai_modes": UI_AI_MODES, "fov_modes": list(FOV_MODES)}
 
     def xu_set(self, feature, value):
@@ -111,6 +118,11 @@ class Camera:
                 self.xu.set_hdr(bool(value))
             elif feature == "face_ae":
                 self.xu.set_face_ae(bool(value))
+            elif feature == "gesture":
+                self.xu.set_gesture(bool(value))
+                self._gesture = bool(value)
+            elif feature == "voice":
+                self.xu.set_voice(bool(value))
             else:
                 raise ValueError(f"unknown feature {feature!r}")
 
@@ -934,7 +946,8 @@ function renderXU(){
     seg.append(b);
   });
   const tg=$('#xutoggles'); tg.innerHTML='';
-  tg.append(xuToggleRow('HDR','hdr'),xuToggleRow('Face-priority exposure','face_ae'));
+  tg.append(xuToggleRow('HDR','hdr'),xuToggleRow('Face-priority exposure','face_ae'),
+            xuToggleRow('Gesture control','gesture'),xuToggleRow('Voice control','voice'));
 }
 
 /* ---- presets: go / save / rename ---- */
