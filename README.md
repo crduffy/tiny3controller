@@ -17,7 +17,8 @@ pan/tilt/zoom HUD is shown at the top of the page.
 - **PTZ pad** — hold a direction (8-way) to move; `⌂` re-centers. Speed
   selector: Slow / Normal / Fast.
 - **Keyboard** — arrows move, `+`/`−` zoom, `C` centers, `1`–`4` recall a
-  preset, `Shift+1`–`4` saves one.
+  preset, `Shift+1`–`4` saves one. The digit keys match by physical key, so
+  they work on any keyboard layout and on the numeric keypad.
 - **Sliders** — drag, or click the number to type an exact value;
   double-click a label to reset that control to its camera default. Each
   section header has a `reset` button for the whole group.
@@ -27,8 +28,17 @@ pan/tilt/zoom HUD is shown at the top of the page.
   Close-up / Headless / Lower body / Group), field of view (86°/78°/65°), HDR,
   face-priority exposure, gesture control (hand gestures for target
   selection/zoom/etc.) and voice control (the "Hi Tiny" commands), all via the
-  vendor XU (see below). While AI tracking is on, the camera steers itself, so
-  the manual pad is disabled.
+  vendor XU (see below). While AI tracking is on the camera steers itself, so
+  everything that would fight it for the gimbal is locked out. The 8 direction
+  buttons and the speed selector are greyed and genuinely `disabled`; the arrow
+  keys, `C`, `⌂`, preset recall and preset save stay clickable but refuse with
+  an on-screen notice, so you get told why rather than meeting a dead control.
+  Preset *save* is blocked because the firmware stops updating the reported
+  pan/tilt while tracking, so a preset saved then would record stale
+  coordinates. **Zoom stays live on purpose**: it doesn't compete with the
+  tracker for pan/tilt.
+  Note these are UI-level guards — the HTTP API itself still accepts absolute
+  pan/tilt writes, so a script or a second client can override them.
 - The page polls the camera every 2.5 s, so changes made by other apps show up.
 
 ### Live preview
@@ -87,7 +97,10 @@ python3 tiny3_xu.py raw 16 02 02 00 # raw selector-6 register write
 
 All of these are soft, idempotent settings, recoverable from the OBSBOT app or
 a USB re-plug. Note: AI tracking moves the gimbal without updating the reported
-pan/tilt, but recalling a preset (absolute write) re-asserts a known position.
+pan/tilt, so readings taken while it is on are stale — which is why the web UI
+blocks preset *save* during tracking. An absolute write (such as a preset
+recall) re-asserts a known position once tracking is off, and is the normal way
+to recover a confused coordinate frame.
 
 ## Run
 
